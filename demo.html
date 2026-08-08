@@ -40,8 +40,7 @@
   .mdl {
     background: #fff; border-radius: 16px; width: 100%;
     display: flex; flex-direction: column;
-    max-height: calc(100vh - 40px);
-    max-height: calc(100dvh - 40px);
+    max-height: 100%;
     box-shadow: 0 24px 60px rgba(21,36,59,.28);
     overflow: hidden;
   }
@@ -64,17 +63,13 @@
   }
   @media (max-width: 640px) {
     .mdl-bg { padding: 0; }
-    .mdl {
-      max-height: 100vh; height: 100vh;
-      max-height: 100dvh; height: 100dvh;
-      border-radius: 0;
-    }
+    .mdl { max-height: 100%; height: 100%; border-radius: 0; }
     .mdl-foot { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
   }
   /* telas baixas: o modal encosta nas bordas para sobrar altura de conteúdo */
   @media (max-height: 700px) {
     .mdl-bg { padding: 8px; }
-    .mdl { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+    .mdl { max-height: 100%; }
     .mdl-head { padding: 12px 22px; }
     .mdl-body { padding: 14px 22px; }
     .mdl-foot { padding: 10px 22px; }
@@ -403,6 +398,7 @@ const {
  * ================================================================= */
 const MASTER_EMAIL = "helena.sampaio@escritorio.com.br";
 const DEMO = true;
+const BUILD = "2026-08-08-c-demo";
 let STORE = {};
 const ouvintes = {};
 const notificar = p => (ouvintes[p] || []).forEach(fn => fn([...(STORE[p] || [])]));
@@ -853,7 +849,10 @@ const Txt = p => /*#__PURE__*/React.createElement("textarea", {
   }
 });
 
-/* Modal com rolagem interna — cabeçalho e rodapé sempre visíveis. */
+/* Modal com rolagem interna — cabeçalho e rodapé sempre visíveis.
+   Renderizado via portal direto no <body>: qualquer ancestral com transform
+   (as animações de entrada das abas, por exemplo) viraria o quadro de
+   referência do position:fixed e recortaria o modal. */
 function Modal({
   titulo,
   sub,
@@ -874,7 +873,7 @@ function Modal({
       window.removeEventListener("keydown", esc);
     };
   }, [onFechar]);
-  return /*#__PURE__*/React.createElement("div", {
+  const conteudo = /*#__PURE__*/React.createElement("div", {
     className: "mdl-bg",
     onMouseDown: e => {
       if (e.target === e.currentTarget) onFechar();
@@ -921,6 +920,7 @@ function Modal({
   }, children), rodape && /*#__PURE__*/React.createElement("div", {
     className: "mdl-foot"
   }, rodape)));
+  return ReactDOM.createPortal(conteudo, document.body);
 }
 function Tag({
   children,
@@ -1608,7 +1608,13 @@ function Workspace({
       textDecoration: "none",
       fontWeight: 600
     }
-  }, "@jordaoeco.negocios")));
+  }, "@jordaoeco.negocios"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.line
+    }
+  }, " · "), /*#__PURE__*/React.createElement("span", {
+    title: "versão publicada"
+  }, "build ", BUILD)));
 }
 
 /* --------------------------- PAINEL ------------------------------ */

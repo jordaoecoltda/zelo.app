@@ -40,8 +40,7 @@
   .mdl {
     background: #fff; border-radius: 16px; width: 100%;
     display: flex; flex-direction: column;
-    max-height: calc(100vh - 40px);
-    max-height: calc(100dvh - 40px);
+    max-height: 100%;
     box-shadow: 0 24px 60px rgba(21,36,59,.28);
     overflow: hidden;
   }
@@ -64,17 +63,13 @@
   }
   @media (max-width: 640px) {
     .mdl-bg { padding: 0; }
-    .mdl {
-      max-height: 100vh; height: 100vh;
-      max-height: 100dvh; height: 100dvh;
-      border-radius: 0;
-    }
+    .mdl { max-height: 100%; height: 100%; border-radius: 0; }
     .mdl-foot { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
   }
   /* telas baixas: o modal encosta nas bordas para sobrar altura de conteúdo */
   @media (max-height: 700px) {
     .mdl-bg { padding: 8px; }
-    .mdl { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+    .mdl { max-height: 100%; }
     .mdl-head { padding: 12px 22px; }
     .mdl-body { padding: 14px 22px; }
     .mdl-foot { padding: 10px 22px; }
@@ -119,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-08-b";
+const BUILD = "2026-08-08-c";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -314,7 +309,10 @@ const Inp = p => <input {...p} style={{ ...inputStyle, ...(p.style||{}) }} />;
 const Sel = ({ children, ...p }) => <select {...p} style={{ ...inputStyle, ...(p.style||{}) }}>{children}</select>;
 const Txt = p => <textarea {...p} style={{ ...inputStyle, minHeight:80, resize:"vertical", ...(p.style||{}) }} />;
 
-/* Modal com rolagem interna — cabeçalho e rodapé sempre visíveis. */
+/* Modal com rolagem interna — cabeçalho e rodapé sempre visíveis.
+   Renderizado via portal direto no <body>: qualquer ancestral com transform
+   (as animações de entrada das abas, por exemplo) viraria o quadro de
+   referência do position:fixed e recortaria o modal. */
 function Modal({ titulo, sub, onFechar, children, rodape, largura = 720 }) {
   useEffect(() => {
     const before = document.body.style.overflow;
@@ -323,7 +321,8 @@ function Modal({ titulo, sub, onFechar, children, rodape, largura = 720 }) {
     window.addEventListener("keydown", esc);
     return () => { document.body.style.overflow = before; window.removeEventListener("keydown", esc); };
   }, [onFechar]);
-  return (
+
+  const conteudo = (
     <div className="mdl-bg" onMouseDown={e => { if (e.target === e.currentTarget) onFechar(); }}>
       <div className="mdl rise" style={{ maxWidth: largura }} role="dialog" aria-modal="true">
         <div className="mdl-head">
@@ -341,6 +340,8 @@ function Modal({ titulo, sub, onFechar, children, rodape, largura = 720 }) {
       </div>
     </div>
   );
+
+  return ReactDOM.createPortal(conteudo, document.body);
 }
 
 function Tag({ children, cor = C.muted, forte }) {
