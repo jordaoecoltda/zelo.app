@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-08-f";
+const BUILD = "2026-08-08-g";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -444,6 +444,24 @@ function Vazio({ titulo, texto, acao }) {
   );
 }
 
+/* ================================================================= *
+ *  ENCERRAMENTO POR INATIVIDADE
+ * ================================================================= */
+const MINUTOS_INATIVIDADE = 30;
+const SEGUNDOS_AVISO = 120;
+const CHAVE_ATIVIDADE = "zelo.ultimaAtividade";
+const CHAVE_EXPIRADA  = "zelo.sessaoExpirada";
+
+/* O navegador pode bloquear o armazenamento local (aba anônima, política
+   corporativa). Nesses casos o controle continua valendo só em memória. */
+const lerGuardado    = k => { try { return window.localStorage.getItem(k); } catch (e) { return null; } };
+const guardar        = (k, v) => { try { window.localStorage.setItem(k, v); } catch (e) {} };
+const apagarGuardado = k => { try { window.localStorage.removeItem(k); } catch (e) {} };
+
+/* No arquivo de demonstração não faz sentido derrubar a sessão no meio de
+   uma apresentação, então o controle fica desligado lá. */
+const EM_DEMO = typeof DEMO !== "undefined" && DEMO;
+
 function Card({ children, style, ...r }) {
   return <div {...r} style={{ background:C.card, border:`1px solid ${C.lineSoft}`, borderRadius:14, ...style }}>{children}</div>;
 }
@@ -640,6 +658,7 @@ function Login() {
   const [carregando, setCarregando] = useState(false);
   const [recuperar, setRecuperar] = useState(false);
   const [aviso, setAviso] = useState("");
+  const [expirou, setExpirou] = useState(() => lerGuardado(CHAVE_EXPIRADA) === "1");
 
   const entrar = async () => {
     setErro(""); setAviso("");
@@ -647,6 +666,8 @@ function Login() {
     setCarregando(true);
     try {
       await auth.signInWithEmailAndPassword(email.trim(), senha);
+      apagarGuardado(CHAVE_EXPIRADA);
+      guardar(CHAVE_ATIVIDADE, String(Date.now()));
     } catch (e) {
       const m = {
         "auth/invalid-email": "E-mail inválido.",
@@ -690,7 +711,7 @@ function Login() {
           <div style={{ display:"grid", gap:14 }}>
             <Campo label="E-mail">
               <Inp type="email" value={email} autoComplete="username"
-                   onChange={e => setEmail(e.target.value)}
+                   onChange={e => { setEmail(e.target.value); setExpirou(false); }}
                    onKeyDown={e => e.key === "Enter" && (recuperar ? enviarReset() : entrar())}
                    placeholder="voce@escritorio.com.br" />
             </Campo>
@@ -700,6 +721,12 @@ function Login() {
                      onChange={e => setSenha(e.target.value)}
                      onKeyDown={e => e.key === "Enter" && entrar()} placeholder="••••••••" />
               </Campo>
+            )}
+            {expirou && !erro && (
+              <div style={{ fontSize:13, color:C.inkSoft, background:"#9C7C3C14",
+                            padding:"10px 12px", borderRadius:9, lineHeight:1.55 }}>
+                Sua sessão foi encerrada por inatividade. Entre novamente para continuar.
+              </div>
             )}
             {erro && <div style={{ fontSize:13, color:C.late, background:"#B4472E12",
                                    padding:"9px 12px", borderRadius:9 }}>{erro}</div>}
@@ -799,7 +826,7 @@ function Workspace({ user, perfil }) {
             <div style={{ fontSize:12.5, fontWeight:600 }}>{perfil.nome || user.email}</div>
             <div style={{ fontSize:11, color:C.brassSoft }}>{PAPEIS[perfil.papel]}</div>
           </div>
-          <button onClick={() => auth.signOut()} title="Sair"
+          <button onClick={() => { apagarGuardado(CHAVE_ATIVIDADE); auth.signOut(); }} title="Sair"
                   style={{ background:"transparent", border:`1px solid #FFFFFF22`, borderRadius:9,
                            padding:8, color:"#fff", display:"grid", placeItems:"center" }}>
             <Icon.out size={17} />
@@ -845,6 +872,8 @@ function Workspace({ user, perfil }) {
         {aba === "usuarios"   && <Usuarios ctx={ctx} />}
       </main>
 
+      {!EM_DEMO && <ControleInatividade onSair={() => auth.signOut()} />}
+
       <footer style={{ borderTop:`1px solid ${C.line}`, padding:"18px", textAlign:"center",
                        fontSize:11.5, color:C.muted }}>
         Zelo · uma solução{" "}
@@ -855,6 +884,12 @@ function Workspace({ user, perfil }) {
            style={{ color:C.brass, textDecoration:"none", fontWeight:600 }}>@jordaoeco.negocios</a>
         <span style={{ color:C.line }}> · </span>
         <span title="versão publicada">build {BUILD}</span>
+        {!EM_DEMO && (
+          <>
+            <span style={{ color:C.line }}> · </span>
+            <span>sessão encerra após {MINUTOS_INATIVIDADE} min sem uso</span>
+          </>
+        )}
       </footer>
     </div>
   );
@@ -1127,6 +1162,94 @@ function LinhaCliente({ c, onAbrir }) {
         </Tag>
       )}
     </Card>
+  );
+}
+
+/* ------------------ controle de inatividade ---------------------- */
+function ControleInatividade({ onSair }) {
+  const [restante, setRestante] = useState(null);
+  const ultima = useRef(Date.now());
+  const encerrando = useRef(false);
+
+  const renovar = () => {
+    ultima.current = Date.now();
+    guardar(CHAVE_ATIVIDADE, String(ultima.current));
+    setRestante(null);
+  };
+
+  useEffect(() => {
+    /* Retoma o carimbo salvo: recarregar a página ou abrir outra aba não
+       zera a contagem. A folga evita que um carimbo antigo derrube a sessão
+       no instante em que ela abre — proporcional ao limite, nunca à frente
+       do relógio atual. */
+    const salvo = Number(lerGuardado(CHAVE_ATIVIDADE));
+    const limite = MINUTOS_INATIVIDADE * 60000;
+    const folga = Math.min(60000, limite / 2);
+    ultima.current = salvo > 0
+      ? Math.min(Date.now(), Math.max(salvo, Date.now() - limite + folga))
+      : Date.now();
+    guardar(CHAVE_ATIVIDADE, String(ultima.current));
+
+    /* mousemove ficou de fora de propósito: um esbarrão no mouse não deveria
+       manter a sessão viva a noite inteira. Exige uso de verdade. */
+    const eventos = ["mousedown", "keydown", "touchstart", "wheel"];
+    const aoUsar = () => { if (!encerrando.current) renovar(); };
+    eventos.forEach(e => window.addEventListener(e, aoUsar, { passive: true }));
+
+    /* Compara relógio em vez de encadear timers: se a máquina hibernar,
+       o tempo parado conta do mesmo jeito quando ela acordar. */
+    const tique = setInterval(() => {
+      if (encerrando.current) return;
+      /* outra aba pode ter registrado uso mais recente */
+      const deOutraAba = Number(lerGuardado(CHAVE_ATIVIDADE)) || 0;
+      ultima.current = Math.max(ultima.current, deOutraAba);
+
+      const parado = Date.now() - ultima.current;
+      if (parado >= limite) {
+        encerrando.current = true;
+        guardar(CHAVE_EXPIRADA, "1");
+        apagarGuardado(CHAVE_ATIVIDADE);
+        onSair();
+      } else if (parado >= limite - SEGUNDOS_AVISO * 1000) {
+        setRestante(Math.ceil((limite - parado) / 1000));
+      } else {
+        setRestante(r => (r === null ? r : null));
+      }
+    }, 1000);
+
+    return () => {
+      clearInterval(tique);
+      eventos.forEach(e => window.removeEventListener(e, aoUsar));
+    };
+  }, [onSair]);
+
+  if (restante === null) return null;
+
+  const minutos = Math.floor(restante / 60);
+  const segundos = restante % 60;
+
+  return (
+    <Modal titulo="Ainda está aí?" largura={460}
+           sub="A sessão está prestes a ser encerrada por inatividade"
+           onFechar={renovar}
+           rodape={<><Btn kind="ghost" onClick={() => { apagarGuardado(CHAVE_ATIVIDADE); onSair(); }}>
+                       Sair agora</Btn>
+                     <Btn kind="brass" onClick={renovar}>Continuar conectado</Btn></>}>
+      <div style={{ textAlign:"center", padding:"10px 0 4px" }}>
+        <div className="fr" style={{ fontSize:44, fontWeight:700, lineHeight:1.1,
+                                     color: restante <= 30 ? C.late : C.brass }}>
+          {minutos > 0 ? `${minutos}:${pad(segundos)}` : segundos}
+        </div>
+        <div style={{ fontSize:13, color:C.muted, marginTop:6 }}>
+          {minutos > 0 ? "para o encerramento"
+            : segundos === 1 ? "segundo para o encerramento" : "segundos para o encerramento"}
+        </div>
+        <p style={{ fontSize:12.5, color:C.inkSoft, lineHeight:1.6, marginTop:16 }}>
+          O Zelo desconecta após {MINUTOS_INATIVIDADE} minutos sem uso, para proteger os dados
+          dos clientes em computador compartilhado. Cadastros abertos e não salvos serão perdidos.
+        </p>
+      </div>
+    </Modal>
   );
 }
 
