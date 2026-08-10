@@ -398,7 +398,7 @@ const {
  * ================================================================= */
 const MASTER_EMAIL = "helena.sampaio@escritorio.com.br";
 const DEMO = true;
-const BUILD = "2026-08-10-d-demo";
+const BUILD = "2026-08-10-e-demo";
 let STORE = {};
 const ouvintes = {};
 const notificar = p => (ouvintes[p] || []).forEach(fn => fn([...(STORE[p] || [])]));
@@ -456,6 +456,13 @@ const C = {
 const AREAS = ["Cível", "Trabalhista", "Criminal", "Família", "Previdenciário", "Consumidor", "Tributário", "Empresarial", "Outro"];
 const ORIGENS = ["Indicação", "Instagram", "Google", "Site", "WhatsApp", "Parceiro/advogado", "Cliente antigo", "Anúncio pago", "Telefone/balcão", "Outro"];
 const ESTAGIOS = ["Novo lead", "Consulta agendada", "Proposta enviada", "Contrato fechado", "Cliente ativo", "Arquivado"];
+const TEMAS = ["Negativas", "TEA", "Reajuste Abusivo", "Outros"];
+const TEMA_COR = {
+  "Negativas": "#B4472E",
+  "TEA": "#3E6C99",
+  "Reajuste Abusivo": "#9C7C3C",
+  "Outros": "#6F7A87"
+};
 const ESTAGIO_COR = {
   "Novo lead": "#6F7A87",
   "Consulta agendada": "#3E6C99",
@@ -2363,16 +2370,17 @@ function SelectComOutro({
   valor,
   outro,
   onChange,
-  placeholder
+  placeholder,
+  chaveOutro = "Outro"
 }) {
-  const ehOutro = valor === "Outro";
+  const ehOutro = valor === chaveOutro;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Campo, {
     label: label,
     hint: hint,
     obrig: obrig
   }, /*#__PURE__*/React.createElement(Sel, {
     value: valor || "",
-    onChange: e => onChange(e.target.value, e.target.value === "Outro" ? outro : "")
+    onChange: e => onChange(e.target.value, e.target.value === chaveOutro ? outro : "")
   }, /*#__PURE__*/React.createElement("option", {
     value: ""
   }, "Selecione…"), opcoes.map(o => /*#__PURE__*/React.createElement("option", {
@@ -2398,7 +2406,11 @@ function SelectComOutro({
 }
 
 /* Rótulo final: mostra o texto digitado quando a opção é "Outro". */
-const rotulo = (valor, outro) => valor === "Outro" ? outro ? `Outro: ${outro}` : "Outro" : valor || "—";
+const rotulo = (valor, outro, chave = "Outro") => valor === chave ? outro ? `${chave}: ${outro}` : chave : valor || "—";
+
+/* O tema usa "Outros" no plural, então precisa da chave própria. */
+const rotuloTema = c => rotulo(c && c.tema, c && c.temaOutro, "Outros");
+const temaCurto = c => c.tema === "Outros" && c.temaOutro ? c.temaOutro : c.tema;
 
 /* ================================================================= *
  *  CLIENTES
@@ -2417,18 +2429,22 @@ function Clientes({
   const [novo, setNovo] = useState(false);
   const [detalhe, setDetalhe] = useState(null);
   const [importando, setImportando] = useState(false);
+  const [filtroTema, setFiltroTema] = useState("todos");
   const lista = useMemo(() => {
     let l = clientes.itens;
     if (filtro === "abertos") l = l.filter(c => !c.desfecho);
     if (filtro === "ganhos") l = l.filter(c => c.desfecho === "ganho");
     if (filtro === "perdidos") l = l.filter(c => c.desfecho === "perdido");
+    if (filtroTema !== "todos") {
+      l = l.filter(c => filtroTema === "sem" ? !c.tema : c.tema === filtroTema);
+    }
     if (busca.trim()) {
       const b = busca.toLowerCase();
-      l = l.filter(c => [c.nome, c.email, c.telefone, c.area].join(" ").toLowerCase().includes(b));
+      l = l.filter(c => [c.nome, c.email, c.telefone, c.area, c.tema, c.temaOutro].join(" ").toLowerCase().includes(b));
     }
     return l.sort((a, b) => (b.criadoEm || "").localeCompare(a.criadoEm || ""));
-  }, [clientes.itens, busca, filtro]);
-  const pg = usePaginacao(lista, busca + "|" + filtro);
+  }, [clientes.itens, busca, filtro, filtroTema]);
+  const pg = usePaginacao(lista, busca + "|" + filtro + "|" + filtroTema);
   const podeCriar = P.clientes === "tudo" || P.clientes === "editar";
   return /*#__PURE__*/React.createElement("div", {
     className: "rise"
@@ -2492,7 +2508,20 @@ function Clientes({
     value: "perdidos"
   }, "Perdidos"), /*#__PURE__*/React.createElement("option", {
     value: "todos"
-  }, "Todos"))), clientes.carregando ? /*#__PURE__*/React.createElement("p", {
+  }, "Todos")), /*#__PURE__*/React.createElement(Sel, {
+    value: filtroTema,
+    onChange: e => setFiltroTema(e.target.value),
+    style: {
+      maxWidth: 200
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "todos"
+  }, "Todos os temas"), TEMAS.map(t => /*#__PURE__*/React.createElement("option", {
+    key: t,
+    value: t
+  }, t)), /*#__PURE__*/React.createElement("option", {
+    value: "sem"
+  }, "Sem tema"))), clientes.carregando ? /*#__PURE__*/React.createElement("p", {
     style: {
       fontSize: 13,
       color: C.muted
@@ -2579,7 +2608,9 @@ function LinhaCliente({
       fontSize: 15,
       fontWeight: 600
     }
-  }, c.nome), c.ciclo > 1 && /*#__PURE__*/React.createElement(Tag, {
+  }, c.nome), c.tema && /*#__PURE__*/React.createElement(Tag, {
+    cor: TEMA_COR[c.tema] || C.muted
+  }, temaCurto(c)), c.ciclo > 1 && /*#__PURE__*/React.createElement(Tag, {
     cor: C.brass
   }, c.ciclo, "º ciclo")), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2723,6 +2754,8 @@ function ClienteForm({
     email: "",
     cpf: "",
     area: "",
+    tema: "",
+    temaOutro: "",
     origem: "",
     origemOutro: "",
     estagio: "Novo lead",
@@ -2748,12 +2781,20 @@ function ClienteForm({
       setErro("Descreva a origem no campo livre.");
       return;
     }
+    /* O tema é opcional, mas se a escolha for "Outros" o texto passa a ser
+       obrigatório — senão o relatório enche de "Outros" sem significado. */
+    if (f.tema === "Outros" && !String(f.temaOutro || "").trim()) {
+      setErro("Descreva o tema no campo livre.");
+      return;
+    }
     const dados = {
       nome: f.nome.trim(),
       telefone: f.telefone || "",
       email: f.email || "",
       cpf: f.cpf || "",
       area: f.area || "",
+      tema: f.tema || "",
+      temaOutro: f.tema === "Outros" ? String(f.temaOutro || "").trim() : "",
       origem: f.origem,
       origemOutro: f.origem === "Outro" ? f.origemOutro.trim() : "",
       estagio: f.estagio || "Novo lead",
@@ -2824,7 +2865,7 @@ function ClienteForm({
     onChange: e => set("cpf", e.target.value),
     placeholder: "opcional"
   }))), /*#__PURE__*/React.createElement("div", {
-    className: "grid3"
+    className: "grid2"
   }, /*#__PURE__*/React.createElement(Campo, {
     label: "Área do caso"
   }, /*#__PURE__*/React.createElement(Sel, {
@@ -2835,7 +2876,22 @@ function ClienteForm({
   }, "Selecione…"), AREAS.map(a => /*#__PURE__*/React.createElement("option", {
     key: a,
     value: a
-  }, a)))), /*#__PURE__*/React.createElement(Campo, {
+  }, a)))), /*#__PURE__*/React.createElement(SelectComOutro, {
+    label: "Tema",
+    opcoes: TEMAS,
+    chaveOutro: "Outros",
+    hint: "Assunto do caso. Opcional, mas é o que separa o relatório por demanda.",
+    valor: f.tema,
+    outro: f.temaOutro,
+    placeholder: "Ex.: home care negado",
+    onChange: (v, o) => setF(p => ({
+      ...p,
+      tema: v,
+      temaOutro: o
+    }))
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "grid2"
+  }, /*#__PURE__*/React.createElement(Campo, {
     label: "Etapa do funil"
   }, /*#__PURE__*/React.createElement(Sel, {
     value: f.estagio,
@@ -3020,6 +3076,10 @@ const CAMPOS_IMPORT = [{
   rotulo: "Área do caso",
   apelidos: ["area", "area do caso", "assunto", "materia", "tipo", "tipo de caso", "especialidade", "ramo"]
 }, {
+  id: "tema",
+  rotulo: "Tema",
+  apelidos: ["tema", "demanda", "tipo de demanda", "objeto", "subarea", "sub area", "assunto do caso", "natureza"]
+}, {
   id: "origem",
   rotulo: "Origem do lead",
   apelidos: ["origem", "como conheceu", "como chegou", "canal", "fonte", "indicacao", "indicado por"]
@@ -3066,6 +3126,15 @@ const casarOpcao = (valor, opcoes) => {
   const v = semAcento(valor);
   if (!v) return null;
   return opcoes.find(o => semAcento(o) === v) || (v.length >= 3 ? opcoes.find(o => semAcento(o).includes(v) || v.includes(semAcento(o))) : null) || null;
+};
+
+/* "TEA" tem três letras e casaria dentro de qualquer palavra que contenha
+   "tea". Por isso o tema exige igualdade exata nas opções curtas e só
+   aceita aproximação nas longas. */
+const casarTema = valor => {
+  const v = semAcento(valor);
+  if (!v) return null;
+  return TEMAS.find(o => semAcento(o) === v) || casarOpcao(valor, TEMAS.filter(o => o.length >= 6)) || null;
 };
 
 /* "R$ 1.200,00" -> 1200. A planilha pode vir com ponto de milhar,
@@ -3206,6 +3275,7 @@ function ImportarClientes({
         email: pega("email"),
         cpf: pega("cpf"),
         area: pega("area"),
+        tema: pega("tema"),
         origem: pega("origem"),
         estagio: pega("estagio"),
         valorProposta: pega("valorProposta"),
@@ -3224,6 +3294,13 @@ function ImportarClientes({
       const estagio = casarOpcao(bruto.estagio, ESTAGIOS) || "Novo lead";
       const origemPadrao = casarOpcao(bruto.origem, ORIGENS);
 
+      /* Tema é opcional: coluna vazia fica vazia. O que veio preenchido e não
+         bate com a lista entra como "Outros" com o texto original — assim o
+         relatório mostra o que o escritório realmente escreve. */
+      const temaPadrao = casarTema(bruto.tema);
+      const tema = bruto.tema ? temaPadrao || "Outros" : "";
+      const temaOutro = tema === "Outros" && !temaPadrao ? bruto.tema : "";
+
       /* Origem é obrigatória no Zelo porque alimenta o relatório. O que
          a planilha trouxer e não bater com a lista entra como "Outro"
          com o texto original preservado. */
@@ -3239,6 +3316,8 @@ function ImportarClientes({
         email: bruto.email,
         cpf: bruto.cpf,
         area: area || "",
+        tema,
+        temaOutro,
         origem,
         origemOutro,
         estagio,
@@ -3564,7 +3643,7 @@ function ImportarClientes({
     style: {
       background: "#F5F6F4"
     }
-  }, ["", "Nome", "Telefone", "Área", "Origem", "Etapa", "Valor"].map((h, i) => /*#__PURE__*/React.createElement("th", {
+  }, ["", "Nome", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => /*#__PURE__*/React.createElement("th", {
     key: i,
     style: {
       textAlign: "left",
@@ -3598,6 +3677,10 @@ function ImportarClientes({
       padding: "7px 10px"
     }
   }, r.dados && r.dados.area || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados && r.dados.tema ? rotuloTema(r.dados) : "—"), /*#__PURE__*/React.createElement("td", {
     style: {
       padding: "7px 10px"
     }
@@ -3770,7 +3853,7 @@ function ClienteDetalhe({
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Modal, {
     titulo: c.nome,
     largura: 920,
-    sub: `${c.area || "Área não definida"} · origem: ${rotulo(c.origem, c.origemOutro)}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`,
+    sub: `${c.area || "Área não definida"}${c.tema ? ` · ${rotuloTema(c)}` : ""} · origem: ${rotulo(c.origem, c.origemOutro)}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`,
     onFechar: onFechar,
     rodape: /*#__PURE__*/React.createElement(React.Fragment, null, perfil.papel === "master" && /*#__PURE__*/React.createElement(Btn, {
       kind: "danger",
@@ -5118,7 +5201,7 @@ function Followup({
   const itens = useMemo(() => {
     const b = busca.trim().toLowerCase();
     if (!b) return clientes.itens;
-    return clientes.itens.filter(c => [c.nome, c.telefone, c.email, c.area].join(" ").toLowerCase().includes(b));
+    return clientes.itens.filter(c => [c.nome, c.telefone, c.email, c.area, c.tema, c.temaOutro].join(" ").toLowerCase().includes(b));
   }, [clientes.itens, busca]);
   const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
   const pendente = fila.atrasados.length + fila.vencidosHoje;
@@ -5570,7 +5653,13 @@ function Funil({
           fontSize: 11.5,
           color: C.muted
         }
-      }, c.area || "—", " · ", rotulo(c.origem, c.origemOutro)), c.valorProposta ? /*#__PURE__*/React.createElement("div", {
+      }, c.area || "—", " · ", rotulo(c.origem, c.origemOutro)), c.tema && /*#__PURE__*/React.createElement("div", {
+        style: {
+          marginTop: 5
+        }
+      }, /*#__PURE__*/React.createElement(Tag, {
+        cor: TEMA_COR[c.tema] || C.muted
+      }, temaCurto(c))), c.valorProposta ? /*#__PURE__*/React.createElement("div", {
         style: {
           fontSize: 12,
           fontWeight: 600,
@@ -6406,6 +6495,39 @@ function Relatorios({
     })).sort((a, b) => b.total - a.total);
   }, [base]);
 
+  /* tema: volume, conversão e o que foi digitado à mão */
+  const porTema = useMemo(() => {
+    const m = {},
+      livres = {};
+    base.forEach(c => {
+      const k = c.tema || "Sem tema";
+      if (!m[k]) m[k] = {
+        total: 0,
+        ganho: 0,
+        perdido: 0,
+        aberto: 0,
+        valor: 0
+      };
+      m[k].total++;
+      if (c.desfecho === "ganho") {
+        m[k].ganho++;
+        m[k].valor += Number(c.valorProposta) || 0;
+      } else if (c.desfecho === "perdido") m[k].perdido++;else m[k].aberto++;
+      if (c.tema === "Outros" && c.temaOutro) livres[c.temaOutro] = (livres[c.temaOutro] || 0) + 1;
+    });
+    return {
+      lista: Object.entries(m).map(([k, v]) => ({
+        tema: k,
+        ...v,
+        taxa: v.ganho + v.perdido ? Math.round(v.ganho / (v.ganho + v.perdido) * 100) : null
+      })).sort((a, b) => b.total - a.total),
+      livres: Object.entries(livres).map(([k, v]) => ({
+        texto: k,
+        n: v
+      })).sort((a, b) => b.n - a.n)
+    };
+  }, [base]);
+
   /* motivos, com "Outro" agrupado e detalhado */
   const contarMotivos = arr => {
     const m = {},
@@ -6652,6 +6774,91 @@ function Relatorios({
     pct: o.taxa,
     cor: o.taxa >= 50 ? C.ok : o.taxa >= 25 ? C.brass : C.late,
     extra: `${o.ganho} fechado${o.ganho === 1 ? "" : "s"} de ${o.ganho + o.perdido}`
+  }))), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginBottom: 3
+    }
+  }, "Temas dos casos"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "Assunto dos leads no período. Fichas cadastradas antes deste campo existir aparecem como \"Sem tema\"."), porTema.lista.map(t => /*#__PURE__*/React.createElement(Barra, {
+    key: t.tema,
+    rotulo: t.tema,
+    valor: t.total,
+    total: base.length,
+    cor: TEMA_COR[t.tema] || C.muted
+  })), porTema.livres.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      paddingTop: 14,
+      borderTop: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: C.inkSoft,
+      marginBottom: 8
+    }
+  }, "O que foi digitado em \"Outros\""), porTema.livres.map(o => /*#__PURE__*/React.createElement("div", {
+    key: o.texto,
+    style: {
+      display: "flex",
+      gap: 8,
+      fontSize: 12.5,
+      color: C.inkSoft,
+      padding: "4px 0"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginRight: "auto"
+    }
+  }, o.texto), /*#__PURE__*/React.createElement("strong", null, o.n))), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11,
+      color: C.muted,
+      marginTop: 8,
+      lineHeight: 1.5
+    }
+  }, "Texto que se repete bastante é candidato a virar opção fixa da lista."))), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginBottom: 3
+    }
+  }, "Quais temas fecham contrato"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "Percentual de ganhos entre os leads já decididos de cada tema, com o valor já fechado ao lado. Tema que converte bem e aparece pouco é onde falta divulgação."), porTema.lista.filter(t => t.taxa !== null).length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, "Nenhum lead deste período teve desfecho ainda. Marque ganho ou perdido no funil para a conversão por tema aparecer aqui.") : porTema.lista.filter(t => t.taxa !== null).sort((a, b) => b.taxa - a.taxa).map(t => /*#__PURE__*/React.createElement(Barra, {
+    key: t.tema,
+    rotulo: t.tema,
+    valor: `${t.taxa}%`,
+    pct: t.taxa,
+    cor: t.taxa >= 50 ? C.ok : t.taxa >= 25 ? C.brass : C.late,
+    extra: `${t.ganho} de ${t.ganho + t.perdido} · ${brl(t.valor)}`
   }))), /*#__PURE__*/React.createElement(Card, {
     style: {
       padding: 20
@@ -7437,6 +7644,8 @@ function seedDemo() {
     telefone: "(11) 99120-3345",
     email: "acmeireles@email.com",
     area: "Consumidor",
+    tema: "Outros",
+    temaOutro: "cobrança indevida de mensalidade",
     origem: "Google",
     origemOutro: "",
     estagio: "Novo lead",
@@ -7633,6 +7842,112 @@ function seedDemo() {
     observacoes: "",
     followups: conversa(d(-22), [["WhatsApp", false, "Veio pelo anúncio. Questão sindical de categoria, fora da nossa atuação."], ["Ligação", false, "Expliquei que não atuamos com direito coletivo sindical."], ["WhatsApp", false, "Passei o contato da Dra. Cristina, que é da área."], ["WhatsApp", true, "Sem resposta."], ["Ligação", false, "Agradeceu a indicação, já falou com a colega."]]),
     historicoCiclos: []
+  }, {
+    id: "c16",
+    nome: "Regina Aparecida Boaventura",
+    telefone: "(11) 99126-3374",
+    email: "regina.boaventura@email.com",
+    area: "Consumidor",
+    tema: "Negativas",
+    temaOutro: "",
+    origem: "Indicação",
+    origemOutro: "",
+    estagio: "Cliente ativo",
+    valorProposta: 7500,
+    criadoEm: ts(-41),
+    ciclo: 1,
+    inicioCiclo: d(-41),
+    responsavel: "u1",
+    desfecho: "ganho",
+    motivo: "Urgência do caso",
+    motivoOutro: "",
+    desfechoEm: ts(-33),
+    desfechoNota: "Liminar deferida em 48 horas. Cirurgia autorizada pelo plano.",
+    observacoes: "Plano negou cirurgia já agendada alegando carência. Tem a negativa por escrito e o relatório do cirurgião.",
+    followups: conversa(d(-41), [["WhatsApp", false, "Mandou a negativa por escrito e o relatório médico. Cirurgia estava marcada para a semana seguinte."], ["Ligação", false, "Expliquei o pedido de liminar. Ela topou entrar no mesmo dia."], ["WhatsApp", false, "Procuração e documentos assinados. Petição protocolada à tarde."], ["Ligação", false, "Liminar deferida. Plano tem 48 horas para autorizar."], ["WhatsApp", false, "Cirurgia autorizada e remarcada. Contrato de honorários assinado."]]),
+    historicoCiclos: []
+  }, {
+    id: "c17",
+    nome: "Nelson Aguiar Portella",
+    telefone: "(11) 97455-2280",
+    email: "nelson.portella@email.com",
+    area: "Consumidor",
+    tema: "Reajuste Abusivo",
+    temaOutro: "",
+    origem: "Google",
+    origemOutro: "",
+    estagio: "Arquivado",
+    valorProposta: "",
+    criadoEm: ts(-29),
+    ciclo: 1,
+    inicioCiclo: d(-29),
+    responsavel: "u3",
+    desfecho: "perdido",
+    motivo: "Honorário acima do esperado",
+    motivoOutro: "",
+    desfechoEm: ts(-19),
+    desfechoNota: "Achou o honorário alto para o valor que discute por mês.",
+    observacoes: "Reajuste de 61% por mudança de faixa etária aos 59 anos, em plano coletivo por adesão.",
+    followups: conversa(d(-29), [["Ligação", false, "Veio pela busca no Google. Reajuste de 61% na virada da faixa etária."], ["WhatsApp", false, "Mandou os boletos dos últimos 12 meses e o contrato do plano."], ["E-mail", false, "Proposta enviada com honorário de êxito sobre a diferença."], ["Ligação", true, "Sem resposta."], ["WhatsApp", false, "Disse que vai pensar, achou o valor alto."], ["Ligação", false, "Preferiu não seguir por ora."]]),
+    historicoCiclos: []
+  }, {
+    id: "c18",
+    nome: "Camila Ribeiro Nakamura",
+    telefone: "(11) 98340-1926",
+    email: "camila.nakamura@email.com",
+    area: "Consumidor",
+    tema: "TEA",
+    temaOutro: "",
+    origem: "Instagram",
+    origemOutro: "",
+    estagio: "Proposta enviada",
+    valorProposta: 5800,
+    ciclo: 1,
+    responsavel: "u1",
+    observacoes: "Filho de 5 anos com TEA. Plano limitou a terapia ABA a 8 sessões por mês; a prescrição médica é de 20.",
+    ...emAndamento([["WhatsApp", false, "Explicou o caso. Plano cortou de 20 para 8 sessões de ABA por mês, sem justificativa clínica."], ["WhatsApp", false, "Mandou o relatório da neuropediatra, a prescrição e o e-mail do plano com o corte."], ["Ligação", false, "Conversa longa. Falei da tese de rol exemplificativo e do prazo da liminar. Proposta enviada por WhatsApp."]]),
+    historicoCiclos: []
+  }, {
+    id: "c19",
+    nome: "Sebastião Ferraz de Oliveira",
+    telefone: "(11) 96218-7743",
+    email: "",
+    area: "Consumidor",
+    tema: "Negativas",
+    temaOutro: "",
+    origem: "Indicação",
+    origemOutro: "",
+    estagio: "Consulta agendada",
+    valorProposta: 4900,
+    ciclo: 1,
+    responsavel: "u3",
+    observacoes: "Home care negado após alta hospitalar. Esposa cuida sozinha, sem condições de manter enfermagem particular.",
+    ...emAndamento([["Ligação", false, "Indicação da Dona Marlene. Plano negou o home care prescrito na alta."], ["WhatsApp", false, "Mandou a alta hospitalar e o pedido do médico. Falta a negativa por escrito."], ["WhatsApp", true, "Perguntei se o plano formalizou a recusa. Sem resposta ainda."], ["Ligação", false, "Conseguiu o protocolo da recusa por telefone. Consulta marcada para quinta."]]),
+    historicoCiclos: []
+  }, {
+    id: "c20",
+    nome: "Heloísa Cristina Vasques",
+    telefone: "(11) 99503-6612",
+    email: "heloisa.vasques@email.com",
+    area: "Consumidor",
+    tema: "Reajuste Abusivo",
+    temaOutro: "",
+    origem: "Indicação",
+    origemOutro: "",
+    estagio: "Cliente ativo",
+    valorProposta: 6200,
+    criadoEm: ts(-58),
+    ciclo: 1,
+    inicioCiclo: d(-58),
+    responsavel: "u1",
+    desfecho: "ganho",
+    motivo: "Proposta/condição de pagamento",
+    motivoOutro: "",
+    desfechoEm: ts(-47),
+    desfechoNota: "Fechou com honorário parcelado em 6x. Ação de revisão distribuída.",
+    observacoes: "Reajuste anual de 47% em plano individual antigo. Aposentada, mensalidade virou metade da renda.",
+    followups: conversa(d(-58), [["WhatsApp", false, "Indicação de cliente antiga. Reajuste de 47% de um ano para o outro."], ["Ligação", false, "Levantei o histórico de reajustes. Bem acima do teto da ANS para plano individual."], ["Presencial", false, "Veio ao escritório com os boletos desde 2019. Caso bem documentado."], ["E-mail", false, "Proposta enviada com honorário parcelado."], ["WhatsApp", false, "Aceitou a proposta. Contrato assinado."]]),
+    historicoCiclos: []
   }];
 
   /* Base antiga trazida da planilha de controle: dá volume à fila,
@@ -7655,6 +7970,8 @@ function seedDemo() {
       responsavel: k % 3 === 0 ? "u3" : "u1",
       ciclo: 1,
       observacoes: "Ficha trazida da planilha de controle do escritório.",
+      tema: "",
+      temaOutro: "",
       importado: true,
       desfecho: null,
       historicoCiclos: [],

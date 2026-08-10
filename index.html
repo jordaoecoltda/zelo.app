@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-10-d";
+const BUILD = "2026-08-10-e";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -138,6 +138,10 @@ const C = {
 const AREAS = ["Cível","Trabalhista","Criminal","Família","Previdenciário","Consumidor","Tributário","Empresarial","Outro"];
 const ORIGENS = ["Indicação","Instagram","Google","Site","WhatsApp","Parceiro/advogado","Cliente antigo","Anúncio pago","Telefone/balcão","Outro"];
 const ESTAGIOS = ["Novo lead","Consulta agendada","Proposta enviada","Contrato fechado","Cliente ativo","Arquivado"];
+const TEMAS = ["Negativas","TEA","Reajuste Abusivo","Outros"];
+const TEMA_COR = {
+  "Negativas": "#B4472E", "TEA": "#3E6C99", "Reajuste Abusivo": "#9C7C3C", "Outros": "#6F7A87"
+};
 const ESTAGIO_COR = {
   "Novo lead": "#6F7A87", "Consulta agendada": "#3E6C99", "Proposta enviada": "#9C7C3C",
   "Contrato fechado": "#4F7A5C", "Cliente ativo": "#15243B", "Arquivado": "#A6A69C"
@@ -1104,12 +1108,13 @@ const saudacao = () => { const h = new Date().getHours(); return h < 12 ? "Bom d
  *  SELETOR COM CAMPO LIVRE PARA "OUTRO"
  *  Usado em origem do lead, motivo de ganho e motivo de perda.
  * ================================================================= */
-function SelectComOutro({ label, hint, obrig, opcoes, valor, outro, onChange, placeholder }) {
-  const ehOutro = valor === "Outro";
+function SelectComOutro({ label, hint, obrig, opcoes, valor, outro, onChange, placeholder,
+                          chaveOutro = "Outro" }) {
+  const ehOutro = valor === chaveOutro;
   return (
     <div>
       <Campo label={label} hint={hint} obrig={obrig}>
-        <Sel value={valor || ""} onChange={e => onChange(e.target.value, e.target.value === "Outro" ? outro : "")}>
+        <Sel value={valor || ""} onChange={e => onChange(e.target.value, e.target.value === chaveOutro ? outro : "")}>
           <option value="">Selecione…</option>
           {opcoes.map(o => <option key={o} value={o}>{o}</option>)}
         </Sel>
@@ -1128,7 +1133,12 @@ function SelectComOutro({ label, hint, obrig, opcoes, valor, outro, onChange, pl
 }
 
 /* Rótulo final: mostra o texto digitado quando a opção é "Outro". */
-const rotulo = (valor, outro) => valor === "Outro" ? (outro ? `Outro: ${outro}` : "Outro") : (valor || "—");
+const rotulo = (valor, outro, chave = "Outro") =>
+  valor === chave ? (outro ? `${chave}: ${outro}` : chave) : (valor || "—");
+
+/* O tema usa "Outros" no plural, então precisa da chave própria. */
+const rotuloTema = (c) => rotulo(c && c.tema, c && c.temaOutro, "Outros");
+const temaCurto  = (c) => (c.tema === "Outros" && c.temaOutro) ? c.temaOutro : c.tema;
 
 /* ================================================================= *
  *  CLIENTES
@@ -1141,20 +1151,25 @@ function Clientes({ ctx }) {
   const [novo, setNovo] = useState(false);
   const [detalhe, setDetalhe] = useState(null);
   const [importando, setImportando] = useState(false);
+  const [filtroTema, setFiltroTema] = useState("todos");
 
   const lista = useMemo(() => {
     let l = clientes.itens;
     if (filtro === "abertos")  l = l.filter(c => !c.desfecho);
     if (filtro === "ganhos")   l = l.filter(c => c.desfecho === "ganho");
     if (filtro === "perdidos") l = l.filter(c => c.desfecho === "perdido");
+    if (filtroTema !== "todos") {
+      l = l.filter(c => filtroTema === "sem" ? !c.tema : c.tema === filtroTema);
+    }
     if (busca.trim()) {
       const b = busca.toLowerCase();
-      l = l.filter(c => [c.nome, c.email, c.telefone, c.area].join(" ").toLowerCase().includes(b));
+      l = l.filter(c => [c.nome, c.email, c.telefone, c.area, c.tema, c.temaOutro]
+        .join(" ").toLowerCase().includes(b));
     }
     return l.sort((a,b) => (b.criadoEm || "").localeCompare(a.criadoEm || ""));
-  }, [clientes.itens, busca, filtro]);
+  }, [clientes.itens, busca, filtro, filtroTema]);
 
-  const pg = usePaginacao(lista, busca + "|" + filtro);
+  const pg = usePaginacao(lista, busca + "|" + filtro + "|" + filtroTema);
   const podeCriar = P.clientes === "tudo" || P.clientes === "editar";
 
   return (
@@ -1182,6 +1197,11 @@ function Clientes({ ctx }) {
           <option value="ganhos">Ganhos</option>
           <option value="perdidos">Perdidos</option>
           <option value="todos">Todos</option>
+        </Sel>
+        <Sel value={filtroTema} onChange={e => setFiltroTema(e.target.value)} style={{ maxWidth:200 }}>
+          <option value="todos">Todos os temas</option>
+          {TEMAS.map(t => <option key={t} value={t}>{t}</option>)}
+          <option value="sem">Sem tema</option>
         </Sel>
       </div>
 
@@ -1227,6 +1247,7 @@ function LinhaCliente({ c, onAbrir }) {
       <div style={{ flex:1, minWidth:180 }}>
         <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
           <span style={{ fontSize:15, fontWeight:600 }}>{c.nome}</span>
+          {c.tema && <Tag cor={TEMA_COR[c.tema] || C.muted}>{temaCurto(c)}</Tag>}
           {c.ciclo > 1 && <Tag cor={C.brass}>{c.ciclo}º ciclo</Tag>}
         </div>
         <div style={{ fontSize:12, color:C.muted, marginTop:3 }}>
@@ -1342,7 +1363,8 @@ function ClienteForm({ ctx, cliente, onFechar }) {
   const { clientes, perfil } = ctx;
   const ed = !!cliente;
   const [f, setF] = useState(() => cliente ? { ...cliente } : {
-    nome:"", telefone:"", email:"", cpf:"", area:"", origem:"", origemOutro:"",
+    nome:"", telefone:"", email:"", cpf:"", area:"", tema:"", temaOutro:"",
+    origem:"", origemOutro:"",
     estagio:"Novo lead", valorProposta:"", observacoes:"", inicioCadencia: todayISO()
   });
   const [erro, setErro] = useState("");
@@ -1354,9 +1376,16 @@ function ClienteForm({ ctx, cliente, onFechar }) {
     if (f.origem === "Outro" && !String(f.origemOutro || "").trim()) {
       setErro("Descreva a origem no campo livre."); return;
     }
+    /* O tema é opcional, mas se a escolha for "Outros" o texto passa a ser
+       obrigatório — senão o relatório enche de "Outros" sem significado. */
+    if (f.tema === "Outros" && !String(f.temaOutro || "").trim()) {
+      setErro("Descreva o tema no campo livre."); return;
+    }
     const dados = {
       nome: f.nome.trim(), telefone: f.telefone || "", email: f.email || "", cpf: f.cpf || "",
-      area: f.area || "", origem: f.origem, origemOutro: f.origem === "Outro" ? f.origemOutro.trim() : "",
+      area: f.area || "",
+      tema: f.tema || "", temaOutro: f.tema === "Outros" ? String(f.temaOutro || "").trim() : "",
+      origem: f.origem, origemOutro: f.origem === "Outro" ? f.origemOutro.trim() : "",
       estagio: f.estagio || "Novo lead",
       valorProposta: f.valorProposta ? Number(String(f.valorProposta).replace(/\D/g, "")) : "",
       observacoes: f.observacoes || ""
@@ -1397,13 +1426,21 @@ function ClienteForm({ ctx, cliente, onFechar }) {
           </Campo>
         </div>
 
-        <div className="grid3">
+        <div className="grid2">
           <Campo label="Área do caso">
             <Sel value={f.area} onChange={e => set("area", e.target.value)}>
               <option value="">Selecione…</option>
               {AREAS.map(a => <option key={a} value={a}>{a}</option>)}
             </Sel>
           </Campo>
+          <SelectComOutro label="Tema" opcoes={TEMAS} chaveOutro="Outros"
+            hint="Assunto do caso. Opcional, mas é o que separa o relatório por demanda."
+            valor={f.tema} outro={f.temaOutro}
+            placeholder="Ex.: home care negado"
+            onChange={(v, o) => setF(p => ({ ...p, tema:v, temaOutro:o }))} />
+        </div>
+
+        <div className="grid2">
           <Campo label="Etapa do funil">
             <Sel value={f.estagio} onChange={e => set("estagio", e.target.value)}>
               {ESTAGIOS.map(s => <option key={s} value={s}>{s}</option>)}
@@ -1539,6 +1576,8 @@ const CAMPOS_IMPORT = [
     apelidos:["cpf","cnpj","cpf cnpj","documento","doc"] },
   { id:"area", rotulo:"Área do caso",
     apelidos:["area","area do caso","assunto","materia","tipo","tipo de caso","especialidade","ramo"] },
+  { id:"tema", rotulo:"Tema",
+    apelidos:["tema","demanda","tipo de demanda","objeto","subarea","sub area","assunto do caso","natureza"] },
   { id:"origem", rotulo:"Origem do lead",
     apelidos:["origem","como conheceu","como chegou","canal","fonte","indicacao","indicado por"] },
   { id:"estagio", rotulo:"Etapa do funil",
@@ -1577,6 +1616,17 @@ const casarOpcao = (valor, opcoes) => {
   if (!v) return null;
   return opcoes.find(o => semAcento(o) === v)
       || (v.length >= 3 ? opcoes.find(o => semAcento(o).includes(v) || v.includes(semAcento(o))) : null)
+      || null;
+};
+
+/* "TEA" tem três letras e casaria dentro de qualquer palavra que contenha
+   "tea". Por isso o tema exige igualdade exata nas opções curtas e só
+   aceita aproximação nas longas. */
+const casarTema = (valor) => {
+  const v = semAcento(valor);
+  if (!v) return null;
+  return TEMAS.find(o => semAcento(o) === v)
+      || casarOpcao(valor, TEMAS.filter(o => o.length >= 6))
       || null;
 };
 
@@ -1706,7 +1756,7 @@ function ImportarClientes({ ctx, onFechar }) {
       const nome = pega("nome");
       const bruto = {
         nome, telefone: pega("telefone"), email: pega("email"), cpf: pega("cpf"),
-        area: pega("area"), origem: pega("origem"), estagio: pega("estagio"),
+        area: pega("area"), tema: pega("tema"), origem: pega("origem"), estagio: pega("estagio"),
         valorProposta: pega("valorProposta"), observacoes: pega("observacoes")
       };
 
@@ -1720,6 +1770,13 @@ function ImportarClientes({ ctx, onFechar }) {
       const estagio = casarOpcao(bruto.estagio, ESTAGIOS) || "Novo lead";
       const origemPadrao = casarOpcao(bruto.origem, ORIGENS);
 
+      /* Tema é opcional: coluna vazia fica vazia. O que veio preenchido e não
+         bate com a lista entra como "Outros" com o texto original — assim o
+         relatório mostra o que o escritório realmente escreve. */
+      const temaPadrao = casarTema(bruto.tema);
+      const tema = bruto.tema ? (temaPadrao || "Outros") : "";
+      const temaOutro = (tema === "Outros" && !temaPadrao) ? bruto.tema : "";
+
       /* Origem é obrigatória no Zelo porque alimenta o relatório. O que
          a planilha trouxer e não bater com a lista entra como "Outro"
          com o texto original preservado. */
@@ -1732,7 +1789,7 @@ function ImportarClientes({ ctx, onFechar }) {
 
       const dados = {
         nome, telefone: maskTel(bruto.telefone), email: bruto.email, cpf: bruto.cpf,
-        area: area || "", origem, origemOutro,
+        area: area || "", tema, temaOutro, origem, origemOutro,
         estagio, valorProposta: valorParaReais(bruto.valorProposta),
         observacoes: notas.filter(Boolean).join("\n")
       };
@@ -1920,7 +1977,7 @@ function ImportarClientes({ ctx, onFechar }) {
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12.5 }}>
               <thead>
                 <tr style={{ background:"#F5F6F4" }}>
-                  {["", "Nome", "Telefone", "Área", "Origem", "Etapa", "Valor"].map((h, i) => (
+                  {["", "Nome", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => (
                     <th key={i} style={{ textAlign:"left", padding:"8px 10px",
                                          fontWeight:600, color:C.inkSoft, whiteSpace:"nowrap" }}>{h}</th>
                   ))}
@@ -1938,6 +1995,7 @@ function ImportarClientes({ ctx, onFechar }) {
                     <td style={{ padding:"7px 10px" }}>{r.bruto.nome || "—"}</td>
                     <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.telefone) || "—"}</td>
                     <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.area) || "—"}</td>
+                    <td style={{ padding:"7px 10px" }}>{r.dados && r.dados.tema ? rotuloTema(r.dados) : "—"}</td>
                     <td style={{ padding:"7px 10px" }}>
                       {r.dados ? rotulo(r.dados.origem, r.dados.origemOutro) : "—"}
                     </td>
@@ -2069,7 +2127,7 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
   return (
     <>
       <Modal titulo={c.nome} largura={920}
-             sub={`${c.area || "Área não definida"} · origem: ${rotulo(c.origem, c.origemOutro)}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`}
+             sub={`${c.area || "Área não definida"}${c.tema ? ` · ${rotuloTema(c)}` : ""} · origem: ${rotulo(c.origem, c.origemOutro)}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`}
              onFechar={onFechar}
              rodape={<>
                {perfil.papel === "master" && (
@@ -2910,7 +2968,8 @@ function Followup({ ctx }) {
     const b = busca.trim().toLowerCase();
     if (!b) return clientes.itens;
     return clientes.itens.filter(c =>
-      [c.nome, c.telefone, c.email, c.area].join(" ").toLowerCase().includes(b));
+      [c.nome, c.telefone, c.email, c.area, c.tema, c.temaOutro]
+        .join(" ").toLowerCase().includes(b));
   }, [clientes.itens, busca]);
 
   const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
@@ -3165,6 +3224,11 @@ function Funil({ ctx }) {
                         <div style={{ fontSize:11.5, color:C.muted }}>
                           {c.area || "—"} · {rotulo(c.origem, c.origemOutro)}
                         </div>
+                        {c.tema && (
+                          <div style={{ marginTop:5 }}>
+                            <Tag cor={TEMA_COR[c.tema] || C.muted}>{temaCurto(c)}</Tag>
+                          </div>
+                        )}
                         {c.valorProposta ? (
                           <div style={{ fontSize:12, fontWeight:600, color:C.brass, marginTop:5 }}>
                             {brl(c.valorProposta)}
@@ -3606,6 +3670,27 @@ function Relatorios({ ctx }) {
     })).sort((a,b) => b.total - a.total);
   }, [base]);
 
+  /* tema: volume, conversão e o que foi digitado à mão */
+  const porTema = useMemo(() => {
+    const m = {}, livres = {};
+    base.forEach(c => {
+      const k = c.tema || "Sem tema";
+      if (!m[k]) m[k] = { total:0, ganho:0, perdido:0, aberto:0, valor:0 };
+      m[k].total++;
+      if (c.desfecho === "ganho") { m[k].ganho++; m[k].valor += Number(c.valorProposta) || 0; }
+      else if (c.desfecho === "perdido") m[k].perdido++;
+      else m[k].aberto++;
+      if (c.tema === "Outros" && c.temaOutro) livres[c.temaOutro] = (livres[c.temaOutro] || 0) + 1;
+    });
+    return {
+      lista: Object.entries(m).map(([k, v]) => ({
+        tema: k, ...v,
+        taxa: (v.ganho + v.perdido) ? Math.round((v.ganho / (v.ganho + v.perdido)) * 100) : null
+      })).sort((a,b) => b.total - a.total),
+      livres: Object.entries(livres).map(([k, v]) => ({ texto:k, n:v })).sort((a,b) => b.n - a.n)
+    };
+  }, [base]);
+
   /* motivos, com "Outro" agrupado e detalhado */
   const contarMotivos = (arr) => {
     const m = {}, outros = {};
@@ -3744,6 +3829,55 @@ function Relatorios({ ctx }) {
               <Barra key={o.origem} rotulo={o.origem} valor={`${o.taxa}%`} pct={o.taxa}
                      cor={o.taxa >= 50 ? C.ok : o.taxa >= 25 ? C.brass : C.late}
                      extra={`${o.ganho} fechado${o.ganho === 1 ? "" : "s"} de ${o.ganho + o.perdido}`} />
+            ))}
+          </Card>
+
+          {/* volume por tema */}
+          <Card style={{ padding:20 }}>
+            <div className="fr" style={{ fontSize:17, fontWeight:700, marginBottom:3 }}>Temas dos casos</div>
+            <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+              Assunto dos leads no período. Fichas cadastradas antes deste campo existir
+              aparecem como "Sem tema".
+            </p>
+            {porTema.lista.map(t => (
+              <Barra key={t.tema} rotulo={t.tema} valor={t.total} total={base.length}
+                     cor={TEMA_COR[t.tema] || C.muted} />
+            ))}
+            {porTema.livres.length > 0 && (
+              <div style={{ marginTop:14, paddingTop:14, borderTop:`1px solid ${C.lineSoft}` }}>
+                <div style={{ fontSize:12, fontWeight:600, color:C.inkSoft, marginBottom:8 }}>
+                  O que foi digitado em "Outros"
+                </div>
+                {porTema.livres.map(o => (
+                  <div key={o.texto} style={{ display:"flex", gap:8, fontSize:12.5,
+                                              color:C.inkSoft, padding:"4px 0" }}>
+                    <span style={{ marginRight:"auto" }}>{o.texto}</span>
+                    <strong>{o.n}</strong>
+                  </div>
+                ))}
+                <p style={{ fontSize:11, color:C.muted, marginTop:8, lineHeight:1.5 }}>
+                  Texto que se repete bastante é candidato a virar opção fixa da lista.
+                </p>
+              </div>
+            )}
+          </Card>
+
+          {/* conversão por tema */}
+          <Card style={{ padding:20 }}>
+            <div className="fr" style={{ fontSize:17, fontWeight:700, marginBottom:3 }}>Quais temas fecham contrato</div>
+            <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+              Percentual de ganhos entre os leads já decididos de cada tema, com o valor
+              já fechado ao lado. Tema que converte bem e aparece pouco é onde falta divulgação.
+            </p>
+            {porTema.lista.filter(t => t.taxa !== null).length === 0 ? (
+              <p style={{ fontSize:13, color:C.muted }}>
+                Nenhum lead deste período teve desfecho ainda. Marque ganho ou perdido
+                no funil para a conversão por tema aparecer aqui.
+              </p>
+            ) : porTema.lista.filter(t => t.taxa !== null).sort((a,b) => b.taxa - a.taxa).map(t => (
+              <Barra key={t.tema} rotulo={t.tema} valor={`${t.taxa}%`} pct={t.taxa}
+                     cor={t.taxa >= 50 ? C.ok : t.taxa >= 25 ? C.brass : C.late}
+                     extra={`${t.ganho} de ${t.ganho + t.perdido} · ${brl(t.valor)}`} />
             ))}
           </Card>
 
