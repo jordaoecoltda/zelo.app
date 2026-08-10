@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-08-g";
+const BUILD = "2026-08-10-d";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -168,8 +168,22 @@ const MOTIVOS_GANHO = [
   "Outro"
 ];
 
-/* Cadência de follow-up (dias corridos após a data de início do ciclo) */
-const CADENCIA = [1, 3, 5, 7, 15, 28];
+/* ---------------------- cadência de contato ----------------------
+   D1 a D8 em dias seguidos. Cada dia tem três toques de horário fixo:
+   08h, 13h e 17h. São 24 contatos por ciclo e cada um exige o relato
+   do que foi conversado ou enviado.                                 */
+const CADENCIA_DIAS = 8;
+const SLOTS = ["08:00", "13:00", "17:00"];
+const SLOT_NOME = { "08:00":"Manhã", "13:00":"Tarde", "17:00":"Fim do dia" };
+
+/* true  = D1..D8 pulam sábado, domingo e feriado nacional (escritório fechado)
+   false = D1..D8 em dias corridos, inclusive fim de semana                  */
+const CADENCIA_SO_DIA_UTIL = true;
+
+/* Contatos da cadência antiga (D1/D3/D5/D7/D15/D28) não têm horário.
+   Entram como toque da manhã para continuarem funcionando.          */
+const SLOT_PADRAO = "08:00";
+const CADENCIA_RESUMO = `D1 a D8 · ${SLOTS.map(h => h.replace(":", "h")).join(", ")}`;
 
 /* Como o contato foi feito */
 const CANAIS = ["WhatsApp", "Ligação", "E-mail", "Presencial", "Outro"];
@@ -198,6 +212,28 @@ const fmtBR = iso => { if (!iso) return "—"; const [y,m,d] = String(iso).split
 const fmtBRhora = iso => { if (!iso) return "—"; const dt = new Date(iso); return `${pad(dt.getDate())}/${pad(dt.getMonth()+1)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`; };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 const brl = v => v ? `R$ ${Number(v).toLocaleString("pt-BR")}` : "—";
+
+/* ---- horário dos três toques diários ---- */
+const agoraHM   = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const slotDe    = f => (f && f.slot) || SLOT_PADRAO;
+const slotHora  = f => slotDe(f).replace(":", "h");
+/* atrasado = passou do dia · agora = chegou a hora de hoje
+   aguardando = ainda vai chegar hoje · futuro = outro dia         */
+const slotStatus = (f) => {
+  if (!f) return "futuro";
+  if (f.feito) return "feito";
+  const hoje = todayISO();
+  if (f.data < hoje) return "atrasado";
+  if (f.data > hoje) return "futuro";
+  return agoraHM() >= slotDe(f) ? "agora" : "aguardando";
+};
+const SLOT_COR = { atrasado:"#B4472E", agora:"#9C7C3C", aguardando:"#3E6C99",
+                   futuro:"#6F7A87", feito:"#4F7A5C" };
+const SLOT_ROTULO = {
+  atrasado:"atrasado", agora:"cobrar agora", aguardando:"ainda hoje",
+  futuro:"programado", feito:"registrado"
+};
+const chaveFup = f => `${f.data}#${slotDe(f)}`;
 
 const followStatus = iso => { if (!iso) return "futuro"; const d = diffDays(iso); return d < 0 ? "atrasado" : d === 0 ? "hoje" : "futuro"; };
 const statusCor = s => s === "atrasado" ? C.late : s === "hoje" ? C.today : C.ok;
@@ -282,32 +318,48 @@ const ehFimDeSemana = iso => { const d = parseISO(iso).getDay(); return d === 0 
 const ehDiaUtil = iso => !ehFimDeSemana(iso) && !ehFeriado(iso);
 const proximoDiaUtil = iso => { let d = iso, guarda = 0; while (!ehDiaUtil(d) && guarda++ < 30) d = addDays(d, 1); return d; };
 
-/* D1 = um dia depois do início do ciclo (não o próprio dia). */
-const gerarFollowups = (inicioISO) => {
-  let anterior = null;
-  return CADENCIA.map(n => {
-    let data = proximoDiaUtil(addDays(inicioISO, n));
-    /* dois contatos empurrados para o mesmo dia viram um só na prática:
-       o seguinte anda para o próximo dia útil. */
-    if (anterior && data <= anterior) data = proximoDiaUtil(addDays(anterior, 1));
-    anterior = data;
-    return { dia: n, data, feito: false, feitoEm: null,
-             canal: "", semResposta: false, canalOutro: "", nota: "" };
-  });
+/* D1 = primeiro dia depois do início do ciclo. Os três toques de um
+   mesmo dia dividem a data e mudam apenas no horário.              */
+const datasDaCadencia = (inicioISO) => {
+  const datas = []; let d = inicioISO;
+  for (let i = 0; i < CADENCIA_DIAS; i++) {
+    d = CADENCIA_SO_DIA_UTIL ? proximoDiaUtil(addDays(d, 1)) : addDays(d, 1);
+    datas.push(d);
+  }
+  return datas;
 };
 
-/* Reposiciona contatos ainda em aberto que caíram em dia não útil. */
-const ajustarParaDiasUteis = (fups) => {
-  if (!Array.isArray(fups)) return { lista: fups, mudou: 0 };
-  let mudou = 0, anterior = null;
-  const lista = fups.map(f => {
-    if (f.feito) { anterior = f.data; return f; }
-    let data = proximoDiaUtil(f.data);
-    if (anterior && data <= anterior) data = proximoDiaUtil(addDays(anterior, 1));
-    anterior = data;
-    if (data !== f.data) mudou++;
-    return { ...f, data };
+const gerarFollowups = (inicioISO) => {
+  const out = [];
+  datasDaCadencia(inicioISO).forEach((data, i) => {
+    SLOTS.forEach(slot => out.push({
+      dia: i + 1, slot, data, feito: false, feitoEm: null,
+      canal: "", semResposta: false, canalOutro: "", nota: ""
+    }));
   });
+  return out;
+};
+
+/* Cadência antiga: seis contatos sem horário (D1, D3, D5, D7, D15, D28). */
+const ehCadenciaAntiga = (fups) =>
+  Array.isArray(fups) && fups.length > 0 && fups.every(f => !f.slot);
+
+/* Reposiciona contatos em aberto que caíram em dia não útil.
+   Move o dia inteiro — os três toques andam juntos, nunca sozinhos. */
+const ajustarParaDiasUteis = (fups) => {
+  if (!Array.isArray(fups) || !CADENCIA_SO_DIA_UTIL) return { lista: fups, mudou: 0 };
+  const novaData = {};
+  let mudou = 0, ultima = null;
+  [...new Set(fups.map(f => f.data))].sort().forEach(data => {
+    const temAberto = fups.some(f => f.data === data && !f.feito);
+    if (!temAberto) { ultima = data; return; }
+    let d = proximoDiaUtil(data);
+    if (ultima && d <= ultima) d = proximoDiaUtil(addDays(ultima, 1));
+    ultima = d;
+    if (d !== data) { novaData[data] = d; mudou++; }
+  });
+  if (!mudou) return { lista: fups, mudou: 0 };
+  const lista = fups.map(f => (!f.feito && novaData[f.data]) ? { ...f, data: novaData[f.data] } : f);
   return { lista, mudou };
 };
 
@@ -322,7 +374,21 @@ const contarNaoUteis = (clientes) => {
 
 const proximoFollowup = (fups) => {
   if (!Array.isArray(fups)) return null;
-  return fups.filter(f => !f.feito).sort((a,b) => a.data < b.data ? -1 : 1)[0] || null;
+  return fups.filter(f => !f.feito)
+             .sort((a, b) => chaveFup(a).localeCompare(chaveFup(b)))[0] || null;
+};
+
+/* Resumo por dia: usado na tela do cliente e na fila. */
+const agruparPorDia = (fups) => {
+  const mapa = new Map();
+  (Array.isArray(fups) ? fups : []).forEach((f, i) => {
+    const k = `${f.dia}|${f.data}`;
+    if (!mapa.has(k)) mapa.set(k, { dia: f.dia, data: f.data, itens: [] });
+    mapa.get(k).itens.push({ ...f, indice: i });
+  });
+  return [...mapa.values()]
+    .sort((a, b) => a.data.localeCompare(b.data) || a.dia - b.dia)
+    .map(g => ({ ...g, itens: g.itens.sort((x, y) => slotDe(x).localeCompare(slotDe(y))) }));
 };
 
 /* --------------------------- ícones ------------------------------ */
@@ -347,7 +413,8 @@ const Icon = {
   out:    p => <Ic {...p}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></Ic>,
   bell:   p => <Ic {...p}><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></Ic>,
   reopen: p => <Ic {...p}><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></Ic>,
-  menu:   p => <Ic {...p}><path d="M3 6h18M3 12h18M3 18h18"/></Ic>
+  menu:   p => <Ic {...p}><path d="M3 6h18M3 12h18M3 18h18"/></Ic>,
+  upload: p => <Ic {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 9l5-5 5 5"/><path d="M12 4v12"/></Ic>
 };
 
 /* ------------------------ primitivas de UI ----------------------- */
@@ -766,12 +833,14 @@ function Workspace({ user, perfil }) {
   const processos = useColecao("processos");
   const eventos   = useColecao("eventos");
 
-  /* quantos contatos estão vencidos ou marcados para hoje */
+  /* contatos vencidos ou com a hora já batida — o relógio entra na
+     conta para o número virar sozinho às 8h, 13h e 17h */
+  const tique = useRelogio();
   const pendentes = useMemo(() => {
-    const f = filaDoDia(clientes.itens);
-    return { atrasados: f.atrasados.length, hoje: f.hoje.length,
-             total: f.atrasados.length + f.hoje.length };
-  }, [clientes.itens]);
+    const f = filaDoDia(clientes.itens, "todos");
+    return { atrasados: f.atrasados.length, agora: f.vencidosHoje, hoje: f.hojeTotal,
+             total: f.atrasados.length + f.vencidosHoje };
+  }, [clientes.itens, tique]);
 
   /* o contador também vai para o título da aba do navegador */
   useEffect(() => {
@@ -901,12 +970,15 @@ function Painel({ ctx }) {
   const hoje = todayISO();
 
   const emAberto = clientes.itens.filter(c => !c.desfecho);
+  useRelogio();
   const fups = [];
   emAberto.forEach(c => {
-    const p = proximoFollowup(c.followups);
-    if (p && diffDays(p.data) <= 0) fups.push({ cliente:c, fup:p });
+    (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
+      const e = slotStatus(f);
+      if (e === "atrasado" || e === "agora") fups.push({ cliente:c, fup:f });
+    });
   });
-  fups.sort((a,b) => a.fup.data < b.fup.data ? -1 : 1);
+  fups.sort((a,b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
 
   const prazos = [];
   processos.itens.forEach(pr => {
@@ -924,7 +996,7 @@ function Painel({ ctx }) {
 
   const num = [
     { r:"Leads em aberto", v:emAberto.length, cor:C.ink },
-    { r:"Contatos para hoje", v:fups.length, cor: fups.length ? C.late : C.ok },
+    { r:"Contatos a fazer agora", v:fups.length, cor: fups.length ? C.late : C.ok },
     { r:"Prazos em 7 dias", v:prazos.length, cor: prazos.length ? C.brass : C.ok },
     { r:"Contratos fechados", v:ganhos, cor:C.ok }
   ];
@@ -957,7 +1029,7 @@ function Painel({ ctx }) {
           {fups.length === 0
             ? <p style={{ fontSize:13, color:C.muted }}>Nenhum contato pendente. Cadência em dia.</p>
             : fups.slice(0, 6).map(({ cliente, fup }) => (
-                <button key={cliente.id + fup.dia} onClick={() => irPara("followup")}
+                <button key={cliente.id + chaveFup(fup)} onClick={() => irPara("followup")}
                         style={{ width:"100%", textAlign:"left", background:"transparent",
                                  border:"none", borderBottom:`1px solid ${C.lineSoft}`,
                                  padding:"10px 0", display:"flex", alignItems:"center", gap:10 }}>
@@ -965,11 +1037,11 @@ function Painel({ ctx }) {
                     <div style={{ fontSize:13.5, fontWeight:600, overflow:"hidden",
                                   textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{cliente.nome}</div>
                     <div style={{ fontSize:11.5, color:C.muted }}>
-                      D{fup.dia} · {cliente.telefone || cliente.email || "sem contato"}
+                      D{fup.dia} · {slotHora(fup)} · {cliente.telefone || cliente.email || "sem contato"}
                     </div>
                   </div>
-                  <Tag cor={statusCor(followStatus(fup.data))}>
-                    {followStatus(fup.data) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "hoje"}
+                  <Tag cor={SLOT_COR[slotStatus(fup)]}>
+                    {slotStatus(fup) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora"}
                   </Tag>
                 </button>
               ))}
@@ -1068,6 +1140,7 @@ function Clientes({ ctx }) {
   const [editando, setEditando] = useState(null);
   const [novo, setNovo] = useState(false);
   const [detalhe, setDetalhe] = useState(null);
+  const [importando, setImportando] = useState(false);
 
   const lista = useMemo(() => {
     let l = clientes.itens;
@@ -1092,6 +1165,11 @@ function Clientes({ ctx }) {
           {clientes.itens.length} no total
         </span>
         {podeCriar && (
+          <Btn kind="ghost" icon={<Icon.upload size={16} />} onClick={() => setImportando(true)}>
+            Importar planilha
+          </Btn>
+        )}
+        {podeCriar && (
           <Btn kind="brass" icon={<Icon.plus size={16} />} onClick={() => setNovo(true)}>Novo cliente</Btn>
         )}
       </div>
@@ -1112,7 +1190,12 @@ function Clientes({ ctx }) {
       ) : lista.length === 0 ? (
         <Vazio titulo="Nenhum cliente por aqui"
                texto={busca ? "Nada encontrado com esse termo." : "Cadastre o primeiro cliente para começar a acompanhar a cadência de contato."}
-               acao={podeCriar && !busca ? <Btn kind="brass" onClick={() => setNovo(true)}>Cadastrar cliente</Btn> : null} />
+               acao={podeCriar && !busca ? (
+                 <div style={{ display:"flex", gap:8, justifyContent:"center", flexWrap:"wrap" }}>
+                   <Btn kind="brass" onClick={() => setNovo(true)}>Cadastrar cliente</Btn>
+                   <Btn kind="ghost" onClick={() => setImportando(true)}>Importar planilha</Btn>
+                 </div>
+               ) : null} />
       ) : (
         <>
           <div style={{ display:"grid", gap:10 }}>
@@ -1126,6 +1209,7 @@ function Clientes({ ctx }) {
         <ClienteForm ctx={ctx} cliente={editando}
                      onFechar={() => { setNovo(false); setEditando(null); }} />
       )}
+      {importando && <ImportarClientes ctx={ctx} onFechar={() => setImportando(false)} />}
       {detalhe && (
         <ClienteDetalhe ctx={ctx} id={detalhe} onFechar={() => setDetalhe(null)}
                         onEditar={c => { setDetalhe(null); setEditando(c); }} />
@@ -1157,7 +1241,7 @@ function LinhaCliente({ c, onAbrir }) {
 
       {!c.desfecho && prox && (
         <Tag cor={statusCor(st)}>
-          D{prox.dia} · {st === "atrasado" ? `${Math.abs(diffDays(prox.data))}d atrás`
+          D{prox.dia} · {slotHora(prox)} · {st === "atrasado" ? `${Math.abs(diffDays(prox.data))}d atrás`
                         : st === "hoje" ? "hoje" : fmtBR(prox.data)}
         </Tag>
       )}
@@ -1292,7 +1376,7 @@ function ClienteForm({ ctx, cliente, onFechar }) {
 
   return (
     <Modal titulo={ed ? "Editar cliente" : "Novo cliente"} largura={860}
-           sub={ed ? f.nome : "A cadência de contato começa no dia seguinte ao cadastro"}
+           sub={ed ? f.nome : `A cadência começa no dia seguinte: ${CADENCIA_RESUMO}`}
            onFechar={onFechar}
            rodape={<><Btn kind="ghost" onClick={onFechar}>Cancelar</Btn>
                      <Btn kind="brass" onClick={salvar}>{ed ? "Salvar alterações" : "Cadastrar cliente"}</Btn></>}>
@@ -1339,7 +1423,7 @@ function ClienteForm({ ctx, cliente, onFechar }) {
             onChange={(v, o) => setF(p => ({ ...p, origem:v, origemOutro:o }))} />
 
           {!ed && (
-            <Campo label="Início da cadência" hint="D1, D3, D5, D7, D15 e D28 contados a partir desta data.">
+            <Campo label="Início da cadência" hint={`${CADENCIA_RESUMO}. D1 é o primeiro dia útil depois desta data.`}>
               <Inp type="date" value={f.inicioCadencia} onChange={e => set("inicioCadencia", e.target.value)} />
             </Campo>
           )}
@@ -1357,6 +1441,564 @@ function ClienteForm({ ctx, cliente, onFechar }) {
   );
 }
 
+/* ---------------- importação de planilha -------------------------
+   Aceita .csv, .txt, .tsv, .xlsx e .xls, e também colagem direta do
+   Excel ou do Google Planilhas.
+
+   Dois detalhes que costumam estragar importação no Brasil e que
+   estão tratados aqui:
+   1. o Excel em português salva CSV com ponto e vírgula, não vírgula;
+   2. salva em Windows-1252, então ler tudo como UTF-8 transforma
+      "José" em caractere quebrado. Tentamos UTF-8 e caímos para
+      Windows-1252 quando a leitura falha.                            */
+
+const semAcento = t => String(t == null ? "" : t)
+  .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+
+const decodificarBytes = (buffer) => {
+  const bytes = new Uint8Array(buffer);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "");
+  } catch (e) {
+    return new TextDecoder("windows-1252").decode(bytes).replace(/^\uFEFF/, "");
+  }
+};
+
+const detectarSeparador = (texto) => {
+  const linha = texto.split(/\r?\n/).find(l => l.trim()) || "";
+  let melhor = ";", max = 0;
+  [";", ",", "\t", "|"].forEach(sep => {
+    const n = linha.split(sep).length - 1;
+    if (n > max) { max = n; melhor = sep; }
+  });
+  return max === 0 ? ";" : melhor;
+};
+
+/* Parser próprio: campo entre aspas pode conter separador e quebra de
+   linha, e "" dentro das aspas é uma aspa literal. */
+const parseDelimitado = (texto, sep) => {
+  const linhas = [];
+  let campo = "", linha = [], dentroDeAspas = false;
+  for (let i = 0; i < texto.length; i++) {
+    const ch = texto[i];
+    if (dentroDeAspas) {
+      if (ch === '"') {
+        if (texto[i + 1] === '"') { campo += '"'; i++; } else dentroDeAspas = false;
+      } else campo += ch;
+    } else if (ch === '"') dentroDeAspas = true;
+    else if (ch === sep) { linha.push(campo); campo = ""; }
+    else if (ch === "\n") { linha.push(campo); linhas.push(linha); linha = []; campo = ""; }
+    else if (ch !== "\r") campo += ch;
+  }
+  if (campo !== "" || linha.length) { linha.push(campo); linhas.push(linha); }
+  return linhas.filter(l => l.some(c => String(c).trim() !== ""));
+};
+
+/* SheetJS só é baixado se o arquivo for mesmo .xlsx. Quem manda CSV
+   não paga esse download — e a importação por CSV continua funcionando
+   sem internet além da que o Zelo já usa. */
+let _xlsxPromise = null;
+const carregarXLSX = () => {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!_xlsxPromise) _xlsxPromise = new Promise((ok, falha) => {
+    const el = document.createElement("script");
+    el.src = "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js";
+    el.onload  = () => ok(window.XLSX);
+    el.onerror = () => { _xlsxPromise = null; falha(new Error("falha ao carregar o leitor de xlsx")); };
+    document.head.appendChild(el);
+  });
+  return _xlsxPromise;
+};
+
+const lerArquivoPlanilha = async (arquivo) => {
+  const nome = String(arquivo.name || "").toLowerCase();
+  const buffer = await arquivo.arrayBuffer();
+  if (/\.(xlsx|xlsm|xltx|xls)$/.test(nome)) {
+    const XLSX = await carregarXLSX();
+    const wb = XLSX.read(buffer, { type: "array" });
+    const primeira = wb.Sheets[wb.SheetNames[0]];
+    if (!primeira) return [];
+    return XLSX.utils.sheet_to_json(primeira, { header: 1, raw: false, defval: "" })
+      .map(l => (Array.isArray(l) ? l : []).map(c => String(c == null ? "" : c)))
+      .filter(l => l.some(c => c.trim() !== ""));
+  }
+  const texto = decodificarBytes(buffer);
+  return parseDelimitado(texto, detectarSeparador(texto));
+};
+
+/* Campos que o Zelo sabe receber. "apelidos" é o que a planilha do
+   escritório costuma usar como título de coluna. */
+const CAMPOS_IMPORT = [
+  { id:"nome", rotulo:"Nome", obrig:true,
+    apelidos:["nome","cliente","nome completo","nome do cliente","razao social","lead","contato"] },
+  { id:"telefone", rotulo:"Telefone / WhatsApp",
+    apelidos:["telefone","celular","whatsapp","whats","fone","tel","zap","numero"] },
+  { id:"email", rotulo:"E-mail",
+    apelidos:["email","e mail","mail","correio"] },
+  { id:"cpf", rotulo:"CPF / CNPJ",
+    apelidos:["cpf","cnpj","cpf cnpj","documento","doc"] },
+  { id:"area", rotulo:"Área do caso",
+    apelidos:["area","area do caso","assunto","materia","tipo","tipo de caso","especialidade","ramo"] },
+  { id:"origem", rotulo:"Origem do lead",
+    apelidos:["origem","como conheceu","como chegou","canal","fonte","indicacao","indicado por"] },
+  { id:"estagio", rotulo:"Etapa do funil",
+    apelidos:["etapa","estagio","status","situacao","fase","funil"] },
+  { id:"valorProposta", rotulo:"Valor da proposta",
+    apelidos:["valor","proposta","valor da proposta","honorarios","ticket","preco"] },
+  { id:"observacoes", rotulo:"Observações",
+    apelidos:["observacao","observacoes","obs","anotacoes","anotacao","detalhes","descricao","historico","resumo"] }
+];
+
+const adivinharColunas = (cabecalho) => {
+  const norm = cabecalho.map(semAcento);
+  const mapa = {}, usadas = new Set();
+  CAMPOS_IMPORT.forEach(campo => {
+    let achou = -1;
+    campo.apelidos.forEach(ap => {
+      if (achou >= 0) return;
+      const i = norm.findIndex((h, idx) => !usadas.has(idx) && h === ap);
+      if (i >= 0) achou = i;
+    });
+    if (achou < 0) campo.apelidos.forEach(ap => {
+      if (achou >= 0 || ap.length < 3) return;
+      const i = norm.findIndex((h, idx) => !usadas.has(idx) && h.includes(ap));
+      if (i >= 0) achou = i;
+    });
+    if (achou >= 0) { mapa[campo.id] = achou; usadas.add(achou); }
+    else mapa[campo.id] = -1;
+  });
+  return mapa;
+};
+
+/* "Trabalhista", "trabalhista ", "TRABALHISTA" caem todos na mesma
+   opção. O que não bate em nada é tratado adiante, campo a campo. */
+const casarOpcao = (valor, opcoes) => {
+  const v = semAcento(valor);
+  if (!v) return null;
+  return opcoes.find(o => semAcento(o) === v)
+      || (v.length >= 3 ? opcoes.find(o => semAcento(o).includes(v) || v.includes(semAcento(o))) : null)
+      || null;
+};
+
+/* "R$ 1.200,00" -> 1200. A planilha pode vir com ponto de milhar,
+   vírgula decimal, símbolo e espaço. */
+const valorParaReais = (bruto) => {
+  let t = String(bruto == null ? "" : bruto).replace(/[^\d.,-]/g, "").trim();
+  if (!t) return "";
+  if (t.includes(",")) {
+    /* vírgula manda: o ponto que sobrar é separador de milhar */
+    t = t.replace(/\./g, "").replace(",", ".");
+  } else if ((t.match(/\./g) || []).length > 1 || /\.\d{3}$/.test(t)) {
+    /* "1.500" e "1.200.000" são milhar, não decimal — a planilha do
+       escritório escreve valor cheio, não centavos com três casas. */
+    t = t.replace(/\./g, "");
+  }
+  const n = Number(t);
+  return isFinite(n) && n > 0 ? Math.round(n) : "";
+};
+
+/* Data em dd/mm/aaaa, dd-mm-aaaa ou aaaa-mm-dd. */
+const dataParaISO = (bruto) => {
+  const t = String(bruto == null ? "" : bruto).trim();
+  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) {
+    const ano = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${ano}-${pad(Number(m[2]))}-${pad(Number(m[1]))}`;
+  }
+  return "";
+};
+
+/* Duas fichas são a mesma pessoa se batem o nome, ou o telefone, ou o
+   e-mail. Reimportar a planilha inteira por engano não deve duplicar
+   a base. */
+const chavesDeIdentidade = (c) => {
+  const ch = [];
+  if (String(c.nome || "").trim()) ch.push("n:" + semAcento(c.nome));
+  const tel = String(c.telefone || "").replace(/\D/g, "");
+  if (tel.length >= 8) ch.push("t:" + tel.slice(-8));
+  const mail = semAcento(c.email);
+  if (mail.includes("@")) ch.push("e:" + mail);
+  return ch;
+};
+
+const CSV_MODELO = [
+  "Nome;Telefone;E-mail;CPF/CNPJ;Área;Origem;Etapa;Valor;Observações",
+  "Maria Aparecida da Silva;(11) 90000-0000;maria@email.com;;Trabalhista;Indicação;Novo lead;3500;Reclamação trabalhista, audiência marcada",
+  "João Carlos Pereira;(11) 91111-1111;joao@email.com;;Família;Instagram;Em negociação;0;Divórcio consensual"
+].join("\n");
+
+function ImportarClientes({ ctx, onFechar }) {
+  const { clientes, perfil } = ctx;
+  const [etapa, setEtapa]       = useState("arquivo"); // arquivo | mapa | revisao | gravando | fim
+  const [erro, setErro]         = useState("");
+  const [lendo, setLendo]       = useState(false);
+  const [colado, setColado]     = useState("");
+  const [linhas, setLinhas]     = useState([]);
+  const [temCabecalho, setTemCabecalho] = useState(true);
+  const [mapa, setMapa]         = useState({});
+  const [pularDuplicados, setPularDuplicados] = useState(true);
+  const [modoCadencia, setModoCadencia] = useState("nao"); // nao | hoje | data
+  const [dataCadencia, setDataCadencia] = useState(todayISO());
+  const [progresso, setProgresso] = useState(0);
+  const [resultado, setResultado] = useState(null);
+  const inputRef = useRef(null);
+
+  const colunas = useMemo(() => {
+    if (!linhas.length) return [];
+    const largura = Math.max(...linhas.map(l => l.length));
+    if (temCabecalho) {
+      return Array.from({ length: largura }, (_, i) =>
+        String(linhas[0][i] || "").trim() || `Coluna ${i + 1}`);
+    }
+    return Array.from({ length: largura }, (_, i) => `Coluna ${i + 1}`);
+  }, [linhas, temCabecalho]);
+
+  const corpo = useMemo(
+    () => (temCabecalho ? linhas.slice(1) : linhas), [linhas, temCabecalho]);
+
+  const receberLinhas = (ls) => {
+    if (!ls.length) { setErro("A planilha veio vazia — nenhuma linha com conteúdo."); return; }
+    setLinhas(ls);
+    setMapa(adivinharColunas((ls[0] || []).map(x => String(x || ""))));
+    setErro(""); setEtapa("mapa");
+  };
+
+  const escolherArquivo = async (arquivo) => {
+    if (!arquivo) return;
+    setLendo(true); setErro("");
+    try {
+      receberLinhas(await lerArquivoPlanilha(arquivo));
+    } catch (e) {
+      setErro("Não consegui ler este arquivo. Se for .xlsx, confira a internet — o leitor de Excel é baixado na hora. Salvar como CSV também resolve.");
+    }
+    setLendo(false);
+  };
+
+  const usarColado = () => {
+    const t = colado.trim();
+    if (!t) { setErro("Cole o conteúdo da planilha na caixa acima."); return; }
+    receberLinhas(parseDelimitado(t, detectarSeparador(t)));
+  };
+
+  const baixarModelo = () => {
+    const blob = new Blob(["\uFEFF" + CSV_MODELO], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "modelo-clientes-zelo.csv";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  };
+
+  /* Cada linha vira uma prévia com status. Nada é gravado aqui. */
+  const previa = useMemo(() => {
+    if (etapa === "arquivo") return [];
+    const existentes = new Set();
+    clientes.itens.forEach(c => chavesDeIdentidade(c).forEach(k => existentes.add(k)));
+    const vistas = new Set();
+
+    return corpo.map((linha, i) => {
+      const pega = id => {
+        const idx = mapa[id];
+        return idx >= 0 ? String(linha[idx] == null ? "" : linha[idx]).trim() : "";
+      };
+      const nome = pega("nome");
+      const bruto = {
+        nome, telefone: pega("telefone"), email: pega("email"), cpf: pega("cpf"),
+        area: pega("area"), origem: pega("origem"), estagio: pega("estagio"),
+        valorProposta: pega("valorProposta"), observacoes: pega("observacoes")
+      };
+
+      if (!nome) return { i, bruto, status: "erro", motivo: "sem nome" };
+
+      const chaves = chavesDeIdentidade(bruto);
+      const dup = chaves.some(k => existentes.has(k) || vistas.has(k));
+      chaves.forEach(k => vistas.add(k));
+
+      const area = casarOpcao(bruto.area, AREAS);
+      const estagio = casarOpcao(bruto.estagio, ESTAGIOS) || "Novo lead";
+      const origemPadrao = casarOpcao(bruto.origem, ORIGENS);
+
+      /* Origem é obrigatória no Zelo porque alimenta o relatório. O que
+         a planilha trouxer e não bater com a lista entra como "Outro"
+         com o texto original preservado. */
+      const origem = origemPadrao || "Outro";
+      const origemOutro = origemPadrao ? "" : (bruto.origem || "Importado da planilha");
+
+      /* Área que não bate com a lista não é jogada fora: vira anotação. */
+      const notas = [bruto.observacoes];
+      if (bruto.area && !area) notas.push(`Área na planilha: ${bruto.area}`);
+
+      const dados = {
+        nome, telefone: maskTel(bruto.telefone), email: bruto.email, cpf: bruto.cpf,
+        area: area || "", origem, origemOutro,
+        estagio, valorProposta: valorParaReais(bruto.valorProposta),
+        observacoes: notas.filter(Boolean).join("\n")
+      };
+      return { i, bruto, dados, status: dup ? "duplicado" : "novo" };
+    });
+  }, [corpo, mapa, etapa, clientes.itens]);
+
+  const novos      = previa.filter(r => r.status === "novo");
+  const duplicados = previa.filter(r => r.status === "duplicado");
+  const invalidos  = previa.filter(r => r.status === "erro");
+  const aGravar    = pularDuplicados ? novos : novos.concat(duplicados);
+  const nomeMapeado = mapa.nome >= 0;
+
+  const gravar = async () => {
+    setEtapa("gravando"); setProgresso(0);
+    const inicio = modoCadencia === "hoje" ? todayISO()
+                 : modoCadencia === "data" ? (dataCadencia || todayISO()) : null;
+    let ok = 0, falhas = 0;
+    for (let n = 0; n < aGravar.length; n++) {
+      try {
+        await clientes.criar({
+          ...aGravar[n].dados,
+          criadoEm: new Date().toISOString(), criadoPor: perfil.uid,
+          responsavel: perfil.uid, ciclo: 1,
+          inicioCiclo: inicio,
+          followups: inicio ? gerarFollowups(inicio) : [],
+          desfecho: null, historicoCiclos: [], importado: true
+        });
+        ok++;
+      } catch (e) { falhas++; }
+      setProgresso(n + 1);
+    }
+    setResultado({ ok, falhas });
+    setEtapa("fim");
+  };
+
+  const CorStatus = { novo: C.ok, duplicado: C.brass, erro: C.late };
+  const rodape =
+    etapa === "arquivo" ? <Btn kind="ghost" onClick={onFechar}>Cancelar</Btn>
+  : etapa === "mapa" ? <>
+      <Btn kind="ghost" onClick={() => { setEtapa("arquivo"); setLinhas([]); }}>Voltar</Btn>
+      <Btn kind="brass" disabled={!nomeMapeado} onClick={() => setEtapa("revisao")}>Revisar</Btn>
+    </>
+  : etapa === "revisao" ? <>
+      <Btn kind="ghost" onClick={() => setEtapa("mapa")}>Voltar</Btn>
+      <Btn kind="brass" disabled={aGravar.length === 0} onClick={gravar}>
+        Importar {aGravar.length} {aGravar.length === 1 ? "cliente" : "clientes"}
+      </Btn>
+    </>
+  : etapa === "fim" ? <Btn kind="brass" onClick={onFechar}>Fechar</Btn>
+  : null;
+
+  return (
+    <Modal titulo="Importar clientes de planilha" largura={980}
+           sub="Traga a base que o escritório controlava na planilha. Nada é gravado antes da revisão."
+           onFechar={etapa === "gravando" ? () => {} : onFechar} rodape={rodape}>
+
+      {etapa === "arquivo" && (
+        <div style={{ display:"grid", gap:16 }}>
+          <div style={{ border:`1px dashed ${C.line}`, borderRadius:12, padding:"26px 18px",
+                        textAlign:"center", background:"#FAFAF8" }}
+               onDragOver={e => e.preventDefault()}
+               onDrop={e => { e.preventDefault(); escolherArquivo(e.dataTransfer.files[0]); }}>
+            <div style={{ fontSize:14, fontWeight:600, marginBottom:6 }}>
+              Arraste a planilha aqui ou escolha o arquivo
+            </div>
+            <div style={{ fontSize:12, color:C.muted, marginBottom:14 }}>
+              .xlsx, .xls, .csv ou .txt · a primeira aba da planilha é a que vale
+            </div>
+            <input ref={inputRef} type="file" accept=".csv,.txt,.tsv,.xlsx,.xlsm,.xltx,.xls"
+                   style={{ display:"none" }}
+                   onChange={e => escolherArquivo(e.target.files[0])} />
+            <div style={{ display:"flex", gap:8, justifyContent:"center", flexWrap:"wrap" }}>
+              <Btn kind="brass" size="sm" disabled={lendo}
+                   onClick={() => inputRef.current && inputRef.current.click()}>
+                {lendo ? "Lendo…" : "Escolher arquivo"}
+              </Btn>
+              <Btn kind="ghost" size="sm" onClick={baixarModelo}>Baixar modelo em CSV</Btn>
+            </div>
+          </div>
+
+          <Campo label="Ou cole direto da planilha"
+                 hint="Selecione as células no Excel ou no Google Planilhas, copie e cole aqui. Inclua a linha de títulos.">
+            <Txt value={colado} onChange={e => setColado(e.target.value)}
+                 style={{ minHeight:110, fontFamily:"ui-monospace, monospace", fontSize:12.5 }}
+                 placeholder={"Nome\tTelefone\tE-mail\nMaria Silva\t(11) 90000-0000\tmaria@email.com"} />
+          </Campo>
+          <div><Btn kind="ghost" size="sm" onClick={usarColado}>Usar o texto colado</Btn></div>
+
+          {erro && <div style={{ fontSize:13, color:C.late, background:"#B4472E12",
+                                 padding:"9px 12px", borderRadius:9, lineHeight:1.5 }}>{erro}</div>}
+        </div>
+      )}
+
+      {etapa === "mapa" && (
+        <div style={{ display:"grid", gap:16 }}>
+          <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55 }}>
+            {corpo.length} {corpo.length === 1 ? "linha lida" : "linhas lidas"} ·
+            {" "}{colunas.length} {colunas.length === 1 ? "coluna" : "colunas"}.
+            Confira o encaixe abaixo — chutei pelos títulos, mas quem manda é você.
+          </div>
+
+          <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:13 }}>
+            <input type="checkbox" checked={temCabecalho}
+                   onChange={e => { setTemCabecalho(e.target.checked);
+                                    setMapa(adivinharColunas(
+                                      e.target.checked ? (linhas[0] || []).map(x => String(x || "")) : [])); }} />
+            A primeira linha é o título das colunas
+          </label>
+
+          <div style={{ display:"grid", gap:12 }}>
+            {CAMPOS_IMPORT.map(campo => (
+              <div key={campo.id} style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap" }}>
+                <span style={{ fontSize:13, fontWeight:600, width:170 }}>
+                  {campo.rotulo}{campo.obrig && <span style={{ color:C.late }}> *</span>}
+                </span>
+                <Sel value={mapa[campo.id]} style={{ maxWidth:280 }}
+                     onChange={e => setMapa(m => ({ ...m, [campo.id]: Number(e.target.value) }))}>
+                  <option value={-1}>— não importar —</option>
+                  {colunas.map((col, i) => <option key={i} value={i}>{col}</option>)}
+                </Sel>
+                <span style={{ fontSize:11.5, color:C.muted, flex:1, minWidth:140 }}>
+                  {mapa[campo.id] >= 0 && corpo[0]
+                    ? `ex.: ${String(corpo[0][mapa[campo.id]] || "").slice(0, 40) || "(vazio)"}`
+                    : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {!nomeMapeado && (
+            <div style={{ fontSize:13, color:C.late, background:"#B4472E12",
+                          padding:"9px 12px", borderRadius:9 }}>
+              Escolha qual coluna tem o nome do cliente. Sem nome, a ficha não existe.
+            </div>
+          )}
+        </div>
+      )}
+
+      {etapa === "revisao" && (
+        <div style={{ display:"grid", gap:16 }}>
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+            <Tag cor={C.ok} forte>{novos.length} novos</Tag>
+            {duplicados.length > 0 && <Tag cor={C.brass} forte>{duplicados.length} já existem</Tag>}
+            {invalidos.length > 0 && <Tag cor={C.late} forte>{invalidos.length} sem nome</Tag>}
+          </div>
+
+          {duplicados.length > 0 && (
+            <label style={{ display:"flex", alignItems:"flex-start", gap:8, fontSize:13, lineHeight:1.5 }}>
+              <input type="checkbox" checked={pularDuplicados} style={{ marginTop:3 }}
+                     onChange={e => setPularDuplicados(e.target.checked)} />
+              <span>
+                Pular quem já está na base. Comparo por nome, telefone e e-mail —
+                desmarque só se forem mesmo pessoas diferentes com o mesmo nome.
+              </span>
+            </label>
+          )}
+
+          <Campo label="Cadência de contato para os importados"
+                 hint="Cada dia tem três toques. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato.">
+            <Sel value={modoCadencia} onChange={e => setModoCadencia(e.target.value)}>
+              <option value="nao">Não iniciar agora — cadastrar só as fichas</option>
+              <option value="hoje">Começar hoje, para todos</option>
+              <option value="data">Começar em uma data específica</option>
+            </Sel>
+          </Campo>
+
+          {modoCadencia === "data" && (
+            <Campo label="Data de início" hint={`${CADENCIA_RESUMO}. D1 é o primeiro dia útil depois desta data.`}>
+              <Inp type="date" value={dataCadencia} style={{ maxWidth:220 }}
+                   onChange={e => setDataCadencia(e.target.value)} />
+            </Campo>
+          )}
+
+          {modoCadencia !== "nao" && aGravar.length > 0 && (
+            <div style={{ fontSize:12.5, color:C.brass, background:"#9C7C3C12",
+                          padding:"9px 12px", borderRadius:9, lineHeight:1.55 }}>
+              Isso cria {aGravar.length * CADENCIA_DIAS * SLOTS.length} contatos na fila
+              ({aGravar.length} × {CADENCIA_DIAS} dias × {SLOTS.length} toques). Se a ideia é
+              retomar aos poucos, cadastre sem cadência e ligue cliente a cliente na ficha.
+            </div>
+          )}
+
+          <div style={{ border:`1px solid ${C.lineSoft}`, borderRadius:12, overflow:"auto", maxHeight:320 }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12.5 }}>
+              <thead>
+                <tr style={{ background:"#F5F6F4" }}>
+                  {["", "Nome", "Telefone", "Área", "Origem", "Etapa", "Valor"].map((h, i) => (
+                    <th key={i} style={{ textAlign:"left", padding:"8px 10px",
+                                         fontWeight:600, color:C.inkSoft, whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {previa.slice(0, 60).map(r => (
+                  <tr key={r.i} style={{ borderTop:`1px solid ${C.lineSoft}`,
+                                         opacity: r.status === "erro" || (r.status === "duplicado" && pularDuplicados) ? .5 : 1 }}>
+                    <td style={{ padding:"7px 10px" }}>
+                      <Tag cor={CorStatus[r.status]}>
+                        {r.status === "novo" ? "novo" : r.status === "duplicado" ? "já existe" : "sem nome"}
+                      </Tag>
+                    </td>
+                    <td style={{ padding:"7px 10px" }}>{r.bruto.nome || "—"}</td>
+                    <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.telefone) || "—"}</td>
+                    <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.area) || "—"}</td>
+                    <td style={{ padding:"7px 10px" }}>
+                      {r.dados ? rotulo(r.dados.origem, r.dados.origemOutro) : "—"}
+                    </td>
+                    <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.estagio) || "—"}</td>
+                    <td style={{ padding:"7px 10px" }}>{r.dados ? brl(r.dados.valorProposta) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {previa.length > 60 && (
+            <div style={{ fontSize:11.5, color:C.muted }}>
+              Mostrando as 60 primeiras de {previa.length} linhas. A importação leva todas.
+            </div>
+          )}
+        </div>
+      )}
+
+      {etapa === "gravando" && (
+        <div style={{ padding:"24px 4px", textAlign:"center" }}>
+          <div style={{ fontSize:15, fontWeight:600, marginBottom:8 }}>
+            Gravando {progresso} de {aGravar.length}…
+          </div>
+          <div style={{ height:8, background:C.lineSoft, borderRadius:99, overflow:"hidden" }}>
+            <div style={{ height:"100%", background:C.brass, borderRadius:99,
+                          width:`${aGravar.length ? (progresso / aGravar.length) * 100 : 0}%`,
+                          transition:"width .2s" }} />
+          </div>
+          <div style={{ fontSize:12, color:C.muted, marginTop:10 }}>
+            Não feche esta janela até terminar.
+          </div>
+        </div>
+      )}
+
+      {etapa === "fim" && resultado && (
+        <div style={{ padding:"18px 4px", display:"grid", gap:10 }}>
+          <div className="fr" style={{ fontSize:18, fontWeight:700 }}>
+            {resultado.ok} {resultado.ok === 1 ? "cliente importado" : "clientes importados"}
+          </div>
+          <div style={{ fontSize:13, color:C.muted, lineHeight:1.6 }}>
+            {duplicados.length > 0 && pularDuplicados &&
+              `${duplicados.length} ${duplicados.length === 1 ? "linha foi pulada por já existir" : "linhas foram puladas por já existirem"} na base. `}
+            {invalidos.length > 0 &&
+              `${invalidos.length} ${invalidos.length === 1 ? "linha ficou de fora por não ter nome" : "linhas ficaram de fora por não terem nome"}. `}
+            {modoCadencia === "nao"
+              ? "As fichas entraram sem cadência: abra o cliente e use “Iniciar cadência” quando for retomar o contato."
+              : "A cadência já está valendo — confira a aba Follow-up."}
+          </div>
+          {resultado.falhas > 0 && (
+            <div style={{ fontSize:13, color:C.late, background:"#B4472E12",
+                          padding:"9px 12px", borderRadius:9 }}>
+              {resultado.falhas} {resultado.falhas === 1 ? "linha não foi gravada" : "linhas não foram gravadas"}.
+              Pode ter sido queda de conexão — importe a planilha de novo, os que já entraram serão marcados como duplicados.
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 /* ------------------- detalhe do cliente -------------------------- */
 function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
   const { clientes, processos, P, perfil } = ctx;
@@ -1364,12 +2006,21 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
   const [desfechoAberto, setDesfechoAberto] = useState(null); // 'ganho' | 'perdido'
   const [reabrirAberto, setReabrirAberto] = useState(false);
   const [excluirAberto, setExcluirAberto] = useState(false);
+  const [confirmarMigrar, setConfirmarMigrar] = useState(false);
+  const [inicioManual, setInicioManual] = useState(todayISO());
+  const [confirmarInicio, setConfirmarInicio] = useState(false);
+  /* 24 contatos numa tela só é rolagem demais. O padrão mostra os dias
+     que ainda têm toque em aberto; o resto fica a um clique. */
+  const [filtroDias, setFiltroDias] = useState("abertos");
+  const [registro, setRegistro] = useState(null); // { indice, fup }
+  /* Todos os useState ficam acima deste return. Se um hook ficasse
+     abaixo dele, excluir o cliente com a ficha aberta mudaria a
+     quantidade de hooks entre um render e outro e o React quebraria. */
   if (!c) return null;
 
   const fups = Array.isArray(c.followups) ? c.followups : [];
   const procs = processos.itens.filter(p => p.clienteId === id);
   const podeEditar = P.clientes === "tudo" || P.clientes === "editar";
-  const [registro, setRegistro] = useState(null); // { indice, fup }
 
   const salvarRegistro = (i, dados) => {
     const novos = fups.map((f, k) => k === i ? { ...f, ...dados } : f);
@@ -1382,6 +2033,38 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
   };
 
   const encerrado = !!c.desfecho;
+  const antiga = ehCadenciaAntiga(fups);
+  /* Ficha que veio de planilha pode ter sido cadastrada sem cadência. */
+  const semCadencia = fups.length === 0;
+
+  const diasTodos = agruparPorDia(fups);
+  const diasVisiveis = filtroDias === "todos"
+    ? diasTodos
+    : (() => {
+        const abertos = diasTodos.filter(g => g.itens.some(x => !x.feito));
+        return abertos.length ? abertos : diasTodos;
+      })();
+
+  const iniciarCadencia = () => {
+    const inicio = inicioManual || todayISO();
+    clientes.atualizar(id, { followups: gerarFollowups(inicio), inicioCiclo: inicio });
+    setConfirmarInicio(false);
+  };
+  const feitosN = fups.filter(f => f.feito).length;
+
+  /* Migração da cadência antiga: nada é apagado. Os contatos já
+     registrados vão para "contatosAnteriores" e a grade nova começa hoje. */
+  const migrarCadencia = () => {
+    const feitos = fups.filter(f => f.feito)
+      .map(f => ({ dia:f.dia, data:f.data, canal:f.canal || "", canalOutro:f.canalOutro || "",
+                   semResposta: !!f.semResposta, nota:f.nota || "", feitoEm:f.feitoEm || null }));
+    clientes.atualizar(id, {
+      followups: gerarFollowups(todayISO()),
+      inicioCiclo: todayISO(),
+      contatosAnteriores: [ ...(c.contatosAnteriores || []), ...feitos ]
+    });
+    setConfirmarMigrar(false);
+  };
 
   return (
     <>
@@ -1455,71 +2138,206 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
           Cadência de contato{c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}
         </div>
         <div style={{ fontSize:11.5, color:C.muted, marginBottom:12 }}>
-          Início em {fmtBR(c.inicioCiclo)} · D1, D3, D5, D7, D15 e D28
+          {semCadencia
+            ? "Nenhum contato programado ainda."
+            : <>Início em {fmtBR(c.inicioCiclo)} · {antiga ? "cadência antiga: D1, D3, D5, D7, D15 e D28" : CADENCIA_RESUMO}
+               {!antiga && ` · ${feitosN} de ${fups.length} registrados`}</>}
         </div>
 
-        <div style={{ display:"grid", gap:8, marginBottom:20, opacity: encerrado ? .55 : 1 }}>
-          {fups.map((f, i) => {
-            const st = followStatus(f.data);
-            const canal = f.canal === "Outro" ? (f.canalOutro || "Outro") : f.canal;
+        {semCadencia && !encerrado && podeEditar && (
+          <Card style={{ padding:"14px 16px", marginBottom:14, background:"#9C7C3C0F",
+                         borderColor:"#9C7C3C33" }}>
+            <div style={{ fontSize:13.5, fontWeight:600, marginBottom:4 }}>
+              Cadência ainda não iniciada
+            </div>
+            <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55, marginBottom:10 }}>
+              Esta ficha foi cadastrada sem cadência{c.importado ? " na importação da planilha" : ""}.
+              Ao iniciar, o Zelo monta {CADENCIA_RESUMO} a partir da data escolhida —
+              {" "}{CADENCIA_DIAS * SLOTS.length} contatos, começando no primeiro dia útil seguinte.
+            </div>
+            {confirmarInicio ? (
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+                <Inp type="date" value={inicioManual} style={{ maxWidth:180 }}
+                     onChange={e => setInicioManual(e.target.value)} />
+                <Btn kind="ghost" size="sm" onClick={() => setConfirmarInicio(false)}>Cancelar</Btn>
+                <Btn kind="brass" size="sm" onClick={iniciarCadencia}>Iniciar</Btn>
+              </div>
+            ) : (
+              <Btn kind="brass" size="sm" onClick={() => setConfirmarInicio(true)}>
+                Iniciar cadência
+              </Btn>
+            )}
+          </Card>
+        )}
+
+        {antiga && !encerrado && podeEditar && (
+          <Card style={{ padding:"14px 16px", marginBottom:14, background:"#9C7C3C0F",
+                         borderColor:"#9C7C3C33" }}>
+            <div style={{ fontSize:13.5, fontWeight:600, marginBottom:4 }}>
+              Este cliente ainda está na cadência antiga
+            </div>
+            <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55, marginBottom:10 }}>
+              Atualizar cria a grade nova ({CADENCIA_RESUMO}) começando hoje. Os contatos
+              já registrados não somem: ficam guardados abaixo, em “Contatos anteriores”.
+            </div>
+            {confirmarMigrar ? (
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+                <span style={{ fontSize:12.5, fontWeight:600, marginRight:"auto" }}>
+                  Confirma recomeçar a cadência hoje?
+                </span>
+                <Btn kind="ghost" size="sm" onClick={() => setConfirmarMigrar(false)}>Cancelar</Btn>
+                <Btn kind="brass" size="sm" onClick={migrarCadencia}>Sim, atualizar</Btn>
+              </div>
+            ) : (
+              <Btn kind="brass" size="sm" onClick={() => setConfirmarMigrar(true)}>
+                Atualizar para a cadência nova
+              </Btn>
+            )}
+          </Card>
+        )}
+
+        {!semCadencia && (
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center", marginBottom:10 }}>
+            {[["abertos", "Dias em aberto"], ["todos", "Todos os dias"]].map(([v, r]) => {
+              const at = filtroDias === v;
+              return (
+                <button key={v} onClick={() => setFiltroDias(v)}
+                        style={{ padding:"6px 11px", borderRadius:8, fontSize:12, fontWeight:600,
+                                 border:`1px solid ${at ? C.brass : C.line}`,
+                                 background: at ? C.brass : "#fff", color: at ? "#fff" : C.inkSoft,
+                                 cursor:"pointer" }}>{r}</button>
+              );
+            })}
+            <span style={{ fontSize:11.5, color:C.muted }}>
+              {diasVisiveis.length} de {diasTodos.length} {diasTodos.length === 1 ? "dia" : "dias"}
+            </span>
+          </div>
+        )}
+
+        <div style={{ display:"grid", gap:10, marginBottom:20, opacity: encerrado ? .55 : 1 }}>
+          {diasVisiveis.map(g => {
+            const abertosDoDia = g.itens.filter(x => !x.feito).length;
             return (
-              <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:12,
-                    padding:"11px 12px", borderRadius:10, background: f.feito ? "#F5F6F4" : "#fff",
-                    border:`1px solid ${C.lineSoft}` }}>
-                <button disabled={encerrado || !podeEditar}
-                        onClick={() => f.feito ? desfazerRegistro(i) : setRegistro({ indice:i, fup:f })}
-                        aria-label={f.feito ? "Desfazer registro" : "Registrar contato"}
-                        style={{ width:22, height:22, borderRadius:6, flexShrink:0, marginTop:1,
-                                 border:`1.5px solid ${f.feito ? (f.semResposta ? C.brass : C.ok) : C.line}`,
-                                 background: f.feito ? (f.semResposta ? C.brass : C.ok) : "#fff",
-                                 display:"grid", placeItems:"center",
-                                 cursor: encerrado || !podeEditar ? "not-allowed" : "pointer" }}>
-                  {f.feito && <Icon.check size={13} color="#fff" />}
-                </button>
+              <div key={`${g.dia}-${g.data}`}
+                   style={{ border:`1px solid ${C.lineSoft}`, borderRadius:12, overflow:"hidden" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap",
+                              padding:"9px 12px", background:"#F5F6F4" }}>
+                  <span className="fr" style={{ fontSize:14, fontWeight:700 }}>D{g.dia}</span>
+                  <span style={{ fontSize:12.5, color:C.inkSoft }}>{fmtBR(g.data)}</span>
+                  {!ehDiaUtil(g.data) && <Tag cor={C.brass}>{nomeDoFeriado(g.data) || "fim de semana"}</Tag>}
+                  <span style={{ marginLeft:"auto", fontSize:11.5, color:C.muted }}>
+                    {abertosDoDia === 0 ? "dia concluído" : `${abertosDoDia} em aberto`}
+                  </span>
+                </div>
 
-                <div style={{ flex:1, minWidth:0 }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
-                    <span style={{ fontSize:13.5, fontWeight:600, color: f.feito ? C.inkSoft : C.ink }}>
-                      D{f.dia} — {fmtBR(f.data)}
-                    </span>
-                    {f.feito && canal && <Tag cor={CANAL_COR[f.canal] || C.muted}>{canal}</Tag>}
-                    {f.feito && f.semResposta && <Tag cor={C.brass}>sem resposta</Tag>}
-                    {!f.feito && !encerrado && <Tag cor={statusCor(st)}>{URG_LABEL(f.data, false)}</Tag>}
-                  </div>
+                <div style={{ display:"grid" }}>
+                  {g.itens.map(f => {
+                    const est = slotStatus(f);
+                    const canal = f.canal === "Outro" ? (f.canalOutro || "Outro") : f.canal;
+                    const i = f.indice;
+                    return (
+                      <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:12,
+                            padding:"11px 12px", borderTop:`1px solid ${C.lineSoft}`,
+                            background: f.feito ? "#FAFAF8" : "#fff" }}>
+                        <button disabled={encerrado || !podeEditar}
+                                onClick={() => f.feito ? desfazerRegistro(i) : setRegistro({ indice:i, fup:f })}
+                                aria-label={f.feito ? "Desfazer registro" : "Registrar contato"}
+                                style={{ width:22, height:22, borderRadius:6, flexShrink:0, marginTop:1,
+                                         border:`1.5px solid ${f.feito ? (f.semResposta ? C.brass : C.ok) : C.line}`,
+                                         background: f.feito ? (f.semResposta ? C.brass : C.ok) : "#fff",
+                                         display:"grid", placeItems:"center",
+                                         cursor: encerrado || !podeEditar ? "not-allowed" : "pointer" }}>
+                          {f.feito && <Icon.check size={13} color="#fff" />}
+                        </button>
 
-                  {f.feito && (
-                    <>
-                      {f.nota
-                        ? <div style={{ fontSize:12.5, color:C.inkSoft, marginTop:5, lineHeight:1.55,
-                                        whiteSpace:"pre-wrap" }}>{f.nota}</div>
-                        : <div style={{ fontSize:12, color:C.muted, marginTop:5, fontStyle:"italic" }}>
-                            Sem anotação do que foi conversado.
-                          </div>}
-                      <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:6 }}>
-                        <span style={{ fontSize:11, color:C.muted }}>
-                          registrado em {fmtBRhora(f.feitoEm)}
-                        </span>
-                        {!encerrado && podeEditar && (
-                          <button onClick={() => setRegistro({ indice:i, fup:f })}
-                                  style={{ background:"none", border:"none", padding:0, fontSize:11,
-                                           color:C.brass, fontWeight:600 }}>editar</button>
-                        )}
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                            <span style={{ fontSize:13.5, fontWeight:600, fontVariantNumeric:"tabular-nums",
+                                           color: f.feito ? C.inkSoft : C.ink }}>
+                              {slotHora(f)}
+                            </span>
+                            <span style={{ fontSize:11.5, color:C.muted }}>{SLOT_NOME[slotDe(f)] || ""}</span>
+                            {f.feito && canal && <Tag cor={CANAL_COR[f.canal] || C.muted}>{canal}</Tag>}
+                            {f.feito && f.semResposta && <Tag cor={C.brass}>sem resposta</Tag>}
+                            {!f.feito && !encerrado && (
+                              <Tag cor={SLOT_COR[est]} forte={est === "atrasado" || est === "agora"}>
+                                {SLOT_ROTULO[est]}
+                              </Tag>
+                            )}
+                          </div>
+
+                          {f.feito && (
+                            <>
+                              {f.nota
+                                ? <div style={{ fontSize:12.5, color:C.inkSoft, marginTop:5, lineHeight:1.55,
+                                                whiteSpace:"pre-wrap" }}>{f.nota}</div>
+                                : <div style={{ fontSize:12, color:C.muted, marginTop:5, fontStyle:"italic" }}>
+                                    Sem anotação do que foi conversado.
+                                  </div>}
+                              <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:6 }}>
+                                <span style={{ fontSize:11, color:C.muted }}>
+                                  registrado em {fmtBRhora(f.feitoEm)}
+                                </span>
+                                {!encerrado && podeEditar && (
+                                  <button onClick={() => setRegistro({ indice:i, fup:f })}
+                                          style={{ background:"none", border:"none", padding:0, fontSize:11,
+                                                   color:C.brass, fontWeight:600 }}>editar</button>
+                                )}
+                              </div>
+                            </>
+                          )}
+
+                          {!f.feito && !encerrado && podeEditar && (
+                            <button onClick={() => setRegistro({ indice:i, fup:f })}
+                                    style={{ background:"none", border:"none", padding:0, fontSize:11.5,
+                                             color:C.brass, fontWeight:600, marginTop:5 }}>
+                              Relatar o que conversou/enviou
+                            </button>
+                          )}
+                        </div>
                       </div>
-                    </>
-                  )}
-
-                  {!f.feito && !encerrado && podeEditar && (
-                    <button onClick={() => setRegistro({ indice:i, fup:f })}
-                            style={{ background:"none", border:"none", padding:0, fontSize:11.5,
-                                     color:C.brass, fontWeight:600, marginTop:5 }}>
-                      Registrar contato
-                    </button>
-                  )}
+                    );
+                  })}
                 </div>
               </div>
             );
           })}
         </div>
+
+        {diasTodos.length > diasVisiveis.length && (
+          <div style={{ fontSize:12.5, color:C.muted, marginTop:-10, marginBottom:20 }}>
+            {diasTodos.length - diasVisiveis.length}{" "}
+            {diasTodos.length - diasVisiveis.length === 1 ? "dia concluído está escondido" : "dias concluídos estão escondidos"}.
+            Use “Todos os dias” para revisar o que já foi relatado.
+          </div>
+        )}
+
+        {/* contatos guardados da cadência antiga */}
+        {Array.isArray(c.contatosAnteriores) && c.contatosAnteriores.length > 0 && (
+          <>
+            <div className="fr" style={{ fontSize:16, fontWeight:700, marginBottom:4 }}>
+              Contatos anteriores
+            </div>
+            <div style={{ fontSize:11.5, color:C.muted, marginBottom:10 }}>
+              Registros feitos na cadência antiga, mantidos como histórico.
+            </div>
+            <div style={{ display:"grid", gap:8, marginBottom:20 }}>
+              {c.contatosAnteriores.map((f, i) => (
+                <div key={i} style={{ padding:"10px 12px", borderRadius:10, background:"#F5F6F4",
+                                      border:`1px solid ${C.lineSoft}` }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:13, fontWeight:600 }}>D{f.dia} — {fmtBR(f.data)}</span>
+                    {f.canal && <Tag cor={CANAL_COR[f.canal] || C.muted}>
+                      {f.canal === "Outro" ? (f.canalOutro || "Outro") : f.canal}</Tag>}
+                    {f.semResposta && <Tag cor={C.brass}>sem resposta</Tag>}
+                  </div>
+                  {f.nota && <div style={{ fontSize:12.5, color:C.inkSoft, marginTop:5,
+                                           lineHeight:1.55, whiteSpace:"pre-wrap" }}>{f.nota}</div>}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
         {/* histórico de ciclos anteriores */}
         {Array.isArray(c.historicoCiclos) && c.historicoCiclos.length > 0 && (
@@ -1609,8 +2427,9 @@ function RegistroContatoModal({ cliente, indice, fup, onSalvar, onFechar }) {
   };
 
   return (
-    <Modal titulo={jaRegistrado ? `Editar o contato D${fup.dia}` : `Registrar o contato D${fup.dia}`}
-           sub={`${cliente.nome} · previsto para ${fmtBR(fup.data)}`} largura={640} onFechar={onFechar}
+    <Modal titulo={`${jaRegistrado ? "Editar" : "Relatar"} o contato D${fup.dia} · ${slotHora(fup)}`}
+           sub={`${cliente.nome} · ${SLOT_NOME[slotDe(fup)] || ""} de ${fmtBR(fup.data)}`}
+           largura={640} onFechar={onFechar}
            rodape={<><Btn kind="ghost" onClick={onFechar}>Cancelar</Btn>
                      <Btn kind="brass" onClick={confirmar}>
                        {jaRegistrado ? "Salvar alterações" : "Registrar contato"}</Btn></>}>
@@ -1646,7 +2465,7 @@ function RegistroContatoModal({ cliente, indice, fup, onSalvar, onFechar }) {
           <span>
             <span style={{ fontSize:13.5, fontWeight:600, display:"block" }}>Não consegui falar</span>
             <span style={{ fontSize:12, color:C.muted }}>
-              Tentativa sem resposta. O contato conta como feito e a cadência segue para o próximo dia.
+              Tentativa sem resposta. O toque conta como feito e a cadência segue para o próximo horário.
             </span>
           </span>
         </label>
@@ -1891,7 +2710,7 @@ function ReabrirModal({ cliente, ctx, onFechar }) {
           com a cadência recomeçando em D1.
         </div>
 
-        <Campo label="Início da nova cadência" hint="D1, D3, D5, D7, D15 e D28 a partir desta data.">
+        <Campo label="Início da nova cadência" hint={`${CADENCIA_RESUMO}, a partir desta data.`}>
           <Inp type="date" value={inicio} onChange={e => setInicio(e.target.value)} />
         </Campo>
 
@@ -1913,42 +2732,208 @@ function ReabrirModal({ cliente, ctx, onFechar }) {
 /* ================================================================= *
  *  FOLLOW-UP — a fila de contatos do dia
  * ================================================================= */
+/* Relógio de minuto. Sem ele a fila não perceberia a virada das 13h
+   e das 17h com a tela já aberta.                                   */
+function useRelogio(ms = 30000) {
+  const [t, setT] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setT(Date.now()), ms);
+    return () => clearInterval(id);
+  }, [ms]);
+  return t;
+}
+
 function listarPendencias(clientes) {
   const fila = [];
   clientes.filter(c => !c.desfecho).forEach(c => {
     (Array.isArray(c.followups) ? c.followups : []).forEach((f, i) => {
-      if (!f.feito) fila.push({ cliente: c, fup: f, indice: i, dias: diffDays(f.data) });
+      if (!f.feito) fila.push({ cliente: c, fup: f, indice: i,
+                                dias: diffDays(f.data), estado: slotStatus(f) });
     });
   });
-  return fila.sort((a, b) => a.fup.data < b.fup.data ? -1 : a.fup.data > b.fup.data ? 1 : 0);
+  return fila.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
 }
 
-/* Só o contato mais próximo de cada cliente entra na fila: cobrar D1 e D3 da
-   mesma pessoa no mesmo dia é ligar duas vezes para dizer a mesma coisa. */
-function filaDoDia(clientes) {
-  const porCliente = {};
-  listarPendencias(clientes).forEach(p => {
-    if (!porCliente[p.cliente.id]) porCliente[p.cliente.id] = p;
-  });
-  const fila = Object.values(porCliente);
+/* Agora cada cliente aparece até três vezes no mesmo dia — é essa a
+   intenção da cadência nova. O dia de hoje é quebrado em três blocos,
+   um por horário, porque é assim que a secretária trabalha: senta às
+   8h e faz a lista das 8h. Misturar os três num "cobrar agora" só
+   embaralha o que já tinha ordem.                                    */
+function filaDoDia(clientes, slotFiltro) {
+  let fila = listarPendencias(clientes);
+  if (slotFiltro && slotFiltro !== "todos") fila = fila.filter(p => slotDe(p.fup) === slotFiltro);
+  const hoje = todayISO();
+  const doDia = fila.filter(p => p.fup.data === hoje);
   return {
-    atrasados: fila.filter(p => p.dias < 0),
-    hoje:      fila.filter(p => p.dias === 0),
-    semana:    fila.filter(p => p.dias > 0 && p.dias <= 7),
-    depois:    fila.filter(p => p.dias > 7)
+    atrasados: fila.filter(p => p.estado === "atrasado"),
+    blocos: SLOTS.map(sl => {
+      const itens = doDia.filter(p => slotDe(p.fup) === sl);
+      return { slot: sl, itens, vencido: itens.some(p => p.estado === "agora") };
+    }).filter(b => !slotFiltro || slotFiltro === "todos" || b.slot === slotFiltro),
+    hojeTotal: doDia.length,
+    vencidosHoje: doDia.filter(p => p.estado === "agora").length,
+    semana: fila.filter(p => p.estado === "futuro" && p.dias <= 7),
+    depois: fila.filter(p => p.estado === "futuro" && p.dias > 7)
   };
 }
 
+/* Quantos clientes ainda estão na cadência antiga de seis contatos. */
+const contarCadenciaAntiga = (clientes) =>
+  clientes.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).length;
+
+const CHAVE_AVISO = "zelo.ultimoAviso";
+const CHAVE_AVISO_LIGADO = "zelo.avisosLigados";
+
+/* Aviso do navegador nos horários dos toques.
+   Importante: só dispara com o Zelo aberto em alguma aba. Aviso com o
+   sistema fechado exigiria servidor (Cloud Functions + push), que não
+   existe nesta versão publicada em GitHub Pages.                     */
+function useAvisosDeSlot(fila, ligado) {
+  const marcado = useRef(null);
+  useEffect(() => {
+    if (!ligado || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const hoje = todayISO(), hm = agoraHM();
+    const slotAtual = [...SLOTS].reverse().find(sl => hm >= sl);
+    if (!slotAtual) return;
+    const chave = `${hoje}#${slotAtual}`;
+    if (marcado.current === chave || lerGuardado(CHAVE_AVISO) === chave) {
+      marcado.current = chave; return;
+    }
+    marcado.current = chave;
+    guardar(CHAVE_AVISO, chave);
+    const n = fila.filter(p => p.fup.data === hoje && slotDe(p.fup) === slotAtual).length;
+    if (n === 0) return;
+    try {
+      new Notification(`Zelo · toque das ${slotAtual.replace(":", "h")}`, {
+        body: `${n} ${n === 1 ? "contato para fazer" : "contatos para fazer"} agora.`,
+        tag: "zelo-followup"
+      });
+    } catch (e) {}
+  }, [fila, ligado]);
+}
+
+/* Linha e bloco ficam fora do Followup de propósito: componente
+   declarado dentro de outro é recriado a cada render, e o React trata
+   isso como um componente novo — a paginação voltaria para a página 1
+   a cada letra digitada na busca.                                    */
+function LinhaFila({ p, cor, podeEditar, onAbrir, onRegistrar }) {
+  return (
+    <Card style={{ padding:"12px 15px", display:"flex", alignItems:"center",
+                   gap:14, flexWrap:"wrap", borderLeft:`3px solid ${cor}` }}>
+      <div style={{ width:52, flexShrink:0, textAlign:"center" }}>
+        <div className="fr" style={{ fontSize:15, fontWeight:700, lineHeight:1.1 }}>
+          {slotHora(p.fup)}
+        </div>
+        <div style={{ fontSize:10.5, color:C.muted }}>D{p.fup.dia}</div>
+      </div>
+      <button onClick={onAbrir}
+              style={{ background:"none", border:"none", padding:0, textAlign:"left",
+                       flex:1, minWidth:170 }}>
+        <div style={{ fontSize:14.5, fontWeight:600 }}>{p.cliente.nome}</div>
+        <div style={{ fontSize:12, color:C.muted, marginTop:3 }}>
+          {p.cliente.telefone || p.cliente.email || "sem contato cadastrado"}
+          {p.cliente.area ? ` · ${p.cliente.area}` : ""}
+          {` · ${p.cliente.estagio || "Novo lead"}`}
+        </div>
+      </button>
+
+      <Tag cor={cor} forte={p.dias <= 0}>
+        {p.dias < 0 ? `${Math.abs(p.dias)}d atrás` : p.dias === 0 ? "hoje" : fmtBR(p.fup.data)}
+      </Tag>
+
+      {podeEditar && (
+        <Btn kind={p.estado === "atrasado" || p.estado === "agora" ? "brass" : "ghost"} size="sm"
+             onClick={onRegistrar}>
+          Relatar contato
+        </Btn>
+      )}
+    </Card>
+  );
+}
+
+/* Bloco da fila com paginação própria. Cada bloco conta a sua página:
+   avançar nos atrasados não pode mexer na lista das 13h.            */
+function BlocoFila({ titulo, sub, itens, cor, vazio, chave, aberto,
+                     podeEditar, onAbrir, onRegistrar, etiqueta, recolhivel = true }) {
+  const [expandido, setExpandido] = useState(aberto !== false);
+  const pg = usePaginacao(itens, chave);
+
+  return (
+    <div style={{ marginBottom:22 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:4, flexWrap:"wrap",
+                    cursor: recolhivel ? "pointer" : "default" }}
+           onClick={() => recolhivel && setExpandido(v => !v)}>
+        <span style={{ width:9, height:9, borderRadius:"50%", background:cor, flexShrink:0 }} />
+        <span className="fr" style={{ fontSize:17, fontWeight:700 }}>{titulo}</span>
+        <span style={{ fontSize:13, color:C.muted }}>{itens.length}</span>
+        {etiqueta}
+        {recolhivel && itens.length > 0 && (
+          <span style={{ marginLeft:"auto", fontSize:11.5, color:C.brass, fontWeight:600 }}>
+            {expandido ? "recolher" : "abrir"}
+          </span>
+        )}
+      </div>
+      {sub && <div style={{ fontSize:12, color:C.muted, marginBottom:10, paddingLeft:18 }}>{sub}</div>}
+
+      {itens.length === 0 ? (
+        <p style={{ fontSize:13, color:C.muted, paddingLeft:18 }}>{vazio}</p>
+      ) : !expandido ? null : (
+        <>
+          <div style={{ display:"grid", gap:9 }}>
+            {pg.fatia.map(p => (
+              <LinhaFila key={p.cliente.id + "-" + p.indice} p={p} cor={cor}
+                         podeEditar={podeEditar}
+                         onAbrir={() => onAbrir(p)} onRegistrar={() => onRegistrar(p)} />
+            ))}
+          </div>
+          <Paginacao p={pg} rotulo="contatos" />
+        </>
+      )}
+    </div>
+  );
+}
+
 function Followup({ ctx }) {
-  const { clientes, P } = ctx;
+  const { clientes, P, perfil } = ctx;
   const [registro, setRegistro] = useState(null);
   const [detalhe, setDetalhe] = useState(null);
   const [editando, setEditando] = useState(null);
+  const [busca, setBusca] = useState("");
+  const [slotFiltro, setSlotFiltro] = useState("todos");
+  const [migrando, setMigrando] = useState(false);
   const podeEditar = P.clientes === "tudo" || P.clientes === "editar";
 
-  const fila = useMemo(() => filaDoDia(clientes.itens), [clientes.itens]);
-  const pendente = fila.atrasados.length + fila.hoje.length;
+  useRelogio();                       /* faz a tela virar sozinha às 8h, 13h e 17h */
+  const agora = agoraHM();
+
+  const itens = useMemo(() => {
+    const b = busca.trim().toLowerCase();
+    if (!b) return clientes.itens;
+    return clientes.itens.filter(c =>
+      [c.nome, c.telefone, c.email, c.area].join(" ").toLowerCase().includes(b));
+  }, [clientes.itens, busca]);
+
+  const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
+  const pendente = fila.atrasados.length + fila.vencidosHoje;
+  const chavePg = busca + "|" + slotFiltro;
   const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
+  const antigos = useMemo(() => contarCadenciaAntiga(clientes.itens), [clientes.itens]);
+
+  /* avisos do navegador */
+  const [avisos, setAvisos] = useState(() => lerGuardado(CHAVE_AVISO_LIGADO) === "1");
+  const podeAvisar = typeof Notification !== "undefined";
+  /* O aviso conta os toques do horário que acabou de chegar, sempre
+     sobre a base inteira: filtrar a tela por horário ou digitar na
+     busca não pode silenciar o aviso das 13h. */
+  const filaAvisos = useMemo(() => listarPendencias(clientes.itens), [clientes.itens, agora]);
+  useAvisosDeSlot(filaAvisos, avisos);
+  const alternarAvisos = async () => {
+    if (avisos) { setAvisos(false); guardar(CHAVE_AVISO_LIGADO, "0"); return; }
+    if (!podeAvisar) return;
+    let perm = Notification.permission;
+    if (perm === "default") { try { perm = await Notification.requestPermission(); } catch (e) {} }
+    if (perm === "granted") { setAvisos(true); guardar(CHAVE_AVISO_LIGADO, "1"); }
+  };
 
   const corrigirDiasNaoUteis = () => {
     clientes.itens.filter(c => !c.desfecho).forEach(c => {
@@ -1957,67 +2942,95 @@ function Followup({ ctx }) {
     });
   };
 
+  /* Atualiza todo mundo que ficou na cadência antiga. Nada é apagado:
+     o que já foi registrado vira histórico em "contatosAnteriores". */
+  const migrarTodos = () => {
+    clientes.itens.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).forEach(c => {
+      const feitos = (c.followups || []).filter(f => f.feito)
+        .map(f => ({ dia:f.dia, data:f.data, canal:f.canal || "", canalOutro:f.canalOutro || "",
+                     semResposta: !!f.semResposta, nota:f.nota || "", feitoEm:f.feitoEm || null }));
+      clientes.atualizar(c.id, {
+        followups: gerarFollowups(todayISO()),
+        inicioCiclo: todayISO(),
+        contatosAnteriores: [ ...(c.contatosAnteriores || []), ...feitos ]
+      });
+    });
+    setMigrando(false);
+  };
+
   const salvar = (cliente, i, dados) => {
     const novos = (Array.isArray(cliente.followups) ? cliente.followups : [])
       .map((f, k) => k === i ? { ...f, ...dados } : f);
     clientes.atualizar(cliente.id, { followups: novos });
   };
 
-  const Grupo = ({ titulo, itens, cor, vazio }) => (
-    <div style={{ marginBottom:26 }}>
-      <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:12 }}>
-        <span style={{ width:9, height:9, borderRadius:"50%", background:cor }} />
-        <span className="fr" style={{ fontSize:17, fontWeight:700 }}>{titulo}</span>
-        <span style={{ fontSize:13, color:C.muted }}>{itens.length}</span>
-      </div>
-      {itens.length === 0 ? (
-        <p style={{ fontSize:13, color:C.muted, paddingLeft:18 }}>{vazio}</p>
-      ) : (
-        <div style={{ display:"grid", gap:9 }}>
-          {itens.map(p => (
-            <Card key={p.cliente.id + "-" + p.indice}
-                  style={{ padding:"13px 15px", display:"flex", alignItems:"center",
-                           gap:14, flexWrap:"wrap", borderLeft:`3px solid ${cor}` }}>
-              <button onClick={() => setDetalhe(p.cliente.id)}
-                      style={{ background:"none", border:"none", padding:0, textAlign:"left",
-                               flex:1, minWidth:190 }}>
-                <div style={{ fontSize:14.5, fontWeight:600 }}>{p.cliente.nome}</div>
-                <div style={{ fontSize:12, color:C.muted, marginTop:3 }}>
-                  {p.cliente.telefone || p.cliente.email || "sem contato cadastrado"}
-                  {p.cliente.area ? ` · ${p.cliente.area}` : ""}
-                  {` · ${p.cliente.estagio || "Novo lead"}`}
-                </div>
-              </button>
-
-              <Tag cor={cor} forte={p.dias <= 0}>
-                D{p.fup.dia} · {p.dias < 0 ? `${Math.abs(p.dias)}d atrás`
-                              : p.dias === 0 ? "hoje" : fmtBR(p.fup.data)}
-              </Tag>
-
-              {podeEditar && (
-                <Btn kind={p.dias <= 0 ? "brass" : "ghost"} size="sm"
-                     onClick={() => setRegistro({ cliente:p.cliente, indice:p.indice, fup:p.fup })}>
-                  Registrar contato
-                </Btn>
-              )}
-            </Card>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
   return (
     <div className="rise">
       <div style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap", marginBottom:6 }}>
         <h1 className="fr" style={{ fontSize:26, fontWeight:700, marginRight:"auto" }}>Follow-up</h1>
+        {podeAvisar && (
+          <Btn kind={avisos ? "ok" : "ghost"} size="sm" onClick={alternarAvisos}
+               icon={<Icon.bell size={15} />}>
+            {avisos ? "Avisos ligados" : "Ligar avisos"}
+          </Btn>
+        )}
       </div>
-      <p style={{ fontSize:13, color:C.muted, marginBottom:22, maxWidth:620, lineHeight:1.6 }}>
+      <p style={{ fontSize:13, color:C.muted, marginBottom:6, maxWidth:660, lineHeight:1.6 }}>
         {pendente === 0
-          ? "Nenhum contato pendente para hoje. A cadência está em dia."
-          : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} hoje, contando os atrasados.`}
-        {" "}Cada cliente aparece uma vez só, no contato mais antigo em aberto.
+          ? `Nenhum contato vencido às ${agora.replace(":", "h")}. A cadência está em dia.`
+          : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} agora, contando os atrasados.`}
+        {" "}Cada cliente tem três toques por dia — {SLOTS.map(h => h.replace(":", "h")).join(", ")} — e cada um
+        pede o relato do que foi conversado ou enviado.
       </p>
+      {avisos && (
+        <p style={{ fontSize:11.5, color:C.muted, marginBottom:18, maxWidth:660, lineHeight:1.55 }}>
+          Os avisos do navegador só aparecem com o Zelo aberto em alguma aba.
+          Com o sistema fechado, o computador não tem como ser avisado.
+        </p>
+      )}
+      {!avisos && <div style={{ marginBottom:18 }} />}
+
+      <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:18, alignItems:"center" }}>
+        <Inp value={busca} onChange={e => setBusca(e.target.value)}
+             placeholder="Filtrar por nome, telefone, e-mail…" style={{ maxWidth:320 }} />
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {[["todos", "Todos os horários"], ...SLOTS.map(sl => [sl, sl.replace(":", "h")])].map(([v, r]) => {
+            const at = slotFiltro === v;
+            return (
+              <button key={v} onClick={() => setSlotFiltro(v)}
+                      style={{ padding:"8px 13px", borderRadius:9, fontSize:12.5, fontWeight:600,
+                               border:`1px solid ${at ? C.brass : C.line}`,
+                               background: at ? C.brass : "#fff", color: at ? "#fff" : C.inkSoft,
+                               cursor:"pointer" }}>{r}</button>
+            );
+          })}
+        </div>
+      </div>
+
+      {antigos > 0 && podeEditar && (
+        <Card style={{ padding:"14px 16px", marginBottom:16, background:"#9C7C3C0F",
+                       borderColor:"#9C7C3C33" }}>
+          <div style={{ fontSize:13.5, fontWeight:600, marginBottom:3 }}>
+            {antigos} {antigos === 1 ? "cliente está" : "clientes estão"} na cadência antiga
+          </div>
+          <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55, marginBottom:10 }}>
+            Foram cadastrados quando a régua era D1, D3, D5, D7, D15 e D28, com um contato por dia.
+            Atualizar cria a grade nova ({CADENCIA_RESUMO}) começando hoje. Os contatos já
+            registrados viram histórico dentro de cada cliente — nada é apagado.
+          </div>
+          {migrando ? (
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+              <span style={{ fontSize:12.5, fontWeight:600, marginRight:"auto" }}>
+                Confirma atualizar {antigos} {antigos === 1 ? "cliente" : "clientes"}?
+              </span>
+              <Btn kind="ghost" size="sm" onClick={() => setMigrando(false)}>Cancelar</Btn>
+              <Btn kind="brass" size="sm" onClick={migrarTodos}>Sim, atualizar todos</Btn>
+            </div>
+          ) : (
+            <Btn kind="brass" size="sm" onClick={() => setMigrando(true)}>Atualizar todos</Btn>
+          )}
+        </Card>
+      )}
 
       {emDiaNaoUtil > 0 && podeEditar && (
         <Card style={{ padding:"14px 16px", marginBottom:20, background:"#9C7C3C0F",
@@ -2028,8 +3041,8 @@ function Followup({ ctx }) {
               {emDiaNaoUtil} {emDiaNaoUtil === 1 ? "contato caiu" : "contatos caíram"} em fim de semana ou feriado
             </div>
             <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55 }}>
-              São cadências criadas antes de o sistema respeitar sábado, domingo e feriado nacional.
-              O ajuste move cada um para o próximo dia útil, sem mexer no que já foi feito.
+              O ajuste move o dia inteiro para o próximo dia útil, com os três toques juntos,
+              sem mexer no que já foi registrado.
             </div>
           </div>
           <Btn kind="brass" size="sm" onClick={corrigirDiasNaoUteis}>Mover para dia útil</Btn>
@@ -2040,12 +3053,51 @@ function Followup({ ctx }) {
         <p style={{ fontSize:13, color:C.muted }}>Carregando…</p>
       ) : (
         <>
-          <Grupo titulo="Atrasados" itens={fila.atrasados} cor={C.late}
-                 vazio="Nada atrasado. Bom sinal." />
-          <Grupo titulo="Para hoje" itens={fila.hoje} cor={C.brass}
-                 vazio="Nenhum contato marcado para hoje." />
-          <Grupo titulo="Próximos 7 dias" itens={fila.semana} cor={C.ok}
-                 vazio="Semana sem contatos programados." />
+          <BlocoFila titulo="Atrasados" itens={fila.atrasados} cor={C.late}
+                     chave={chavePg + "|atrasados"} podeEditar={podeEditar}
+                     onAbrir={p => setDetalhe(p.cliente.id)}
+                     onRegistrar={p => setRegistro({ cliente:p.cliente, indice:p.indice, fup:p.fup })}
+                     sub="Toques de dias anteriores que ficaram sem registro. A hora à esquerda é a do toque original."
+                     vazio="Nada atrasado. Bom sinal." />
+
+          <div className="fr" style={{ fontSize:15, fontWeight:700, margin:"26px 0 4px" }}>
+            Hoje, por horário
+          </div>
+          <div style={{ fontSize:12, color:C.muted, marginBottom:14, lineHeight:1.55 }}>
+            {fila.hojeTotal === 0
+              ? "Nenhum toque programado para hoje."
+              : `${fila.hojeTotal} ${fila.hojeTotal === 1 ? "toque" : "toques"} hoje · agora são ${agora.replace(":", "h")}.`}
+          </div>
+
+          {fila.blocos.map(b => {
+            const passou = agora >= b.slot;
+            return (
+              <BlocoFila key={b.slot}
+                         titulo={`${b.slot.replace(":", "h")} · ${SLOT_NOME[b.slot] || ""}`}
+                         itens={b.itens}
+                         cor={b.vencido ? C.brass : passou ? C.ok : "#3E6C99"}
+                         chave={chavePg + "|" + b.slot}
+                         aberto={b.itens.length > 0 && (b.vencido || !passou)}
+                         podeEditar={podeEditar}
+                         onAbrir={p => setDetalhe(p.cliente.id)}
+                         onRegistrar={p => setRegistro({ cliente:p.cliente, indice:p.indice, fup:p.fup })}
+                         etiqueta={b.itens.length === 0 ? null : b.vencido
+                           ? <Tag cor={C.brass} forte>cobrar agora</Tag>
+                           : passou ? <Tag cor={C.ok}>horário concluído</Tag>
+                                    : <Tag cor="#3E6C99">a partir das {b.slot.replace(":", "h")}</Tag>}
+                         sub={null}
+                         vazio={passou ? "Todos os toques deste horário já foram relatados."
+                                       : "Nenhum toque neste horário hoje."} />
+            );
+          })}
+
+          <BlocoFila titulo="Próximos 7 dias" itens={fila.semana} cor={C.ok}
+                     chave={chavePg + "|semana"} aberto={false} podeEditar={podeEditar}
+                     onAbrir={p => setDetalhe(p.cliente.id)}
+                     onRegistrar={p => setRegistro({ cliente:p.cliente, indice:p.indice, fup:p.fup })}
+                     sub="Fica recolhido para não competir com o trabalho de hoje."
+                     vazio="Semana sem contatos programados." />
+
           {fila.depois.length > 0 && (
             <p style={{ fontSize:12.5, color:C.muted }}>
               Mais {fila.depois.length} {fila.depois.length === 1 ? "contato programado" : "contatos programados"} para depois desta semana.

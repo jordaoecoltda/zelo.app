@@ -398,11 +398,14 @@ const {
  * ================================================================= */
 const MASTER_EMAIL = "helena.sampaio@escritorio.com.br";
 const DEMO = true;
-const BUILD = "2026-08-08-g-demo";
+const BUILD = "2026-08-10-d-demo";
 let STORE = {};
 const ouvintes = {};
 const notificar = p => (ouvintes[p] || []).forEach(fn => fn([...(STORE[p] || [])]));
 const notificarTudo = () => Object.keys(ouvintes).forEach(notificar);
+
+/* Dublês do Firebase: mesma superfície de chamada, memória no lugar
+   da rede. Assim o resto do arquivo é idêntico ao do sistema real. */
 const auth = {
   signOut: () => {
     window.reiniciarDemo && window.reiniciarDemo();
@@ -476,8 +479,26 @@ const EVENTO_COR = {
 const MOTIVOS_PERDA = ["Honorário acima do esperado", "Foi para outro escritório", "Caso fora da área de atuação", "Inviável juridicamente (prazo/prova)", "Cliente parou de responder", "Desistiu de acionar", "Resolveu por acordo direto", "Outro"];
 const MOTIVOS_GANHO = ["Indicação de confiança", "Proposta/condição de pagamento", "Urgência do caso", "Atendimento na reunião", "Outro"];
 
-/* Cadência de follow-up (dias corridos após a data de início do ciclo) */
-const CADENCIA = [1, 3, 5, 7, 15, 28];
+/* ---------------------- cadência de contato ----------------------
+   D1 a D8 em dias seguidos. Cada dia tem três toques de horário fixo:
+   08h, 13h e 17h. São 24 contatos por ciclo e cada um exige o relato
+   do que foi conversado ou enviado.                                 */
+const CADENCIA_DIAS = 8;
+const SLOTS = ["08:00", "13:00", "17:00"];
+const SLOT_NOME = {
+  "08:00": "Manhã",
+  "13:00": "Tarde",
+  "17:00": "Fim do dia"
+};
+
+/* true  = D1..D8 pulam sábado, domingo e feriado nacional (escritório fechado)
+   false = D1..D8 em dias corridos, inclusive fim de semana                  */
+const CADENCIA_SO_DIA_UTIL = true;
+
+/* Contatos da cadência antiga (D1/D3/D5/D7/D15/D28) não têm horário.
+   Entram como toque da manhã para continuarem funcionando.          */
+const SLOT_PADRAO = "08:00";
+const CADENCIA_RESUMO = `D1 a D8 · ${SLOTS.map(h => h.replace(":", "h")).join(", ")}`;
 
 /* Como o contato foi feito */
 const CANAIS = ["WhatsApp", "Ligação", "E-mail", "Presencial", "Outro"];
@@ -552,6 +573,39 @@ const fmtBRhora = iso => {
 };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const brl = v => v ? `R$ ${Number(v).toLocaleString("pt-BR")}` : "—";
+
+/* ---- horário dos três toques diários ---- */
+const agoraHM = () => {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+const slotDe = f => f && f.slot || SLOT_PADRAO;
+const slotHora = f => slotDe(f).replace(":", "h");
+/* atrasado = passou do dia · agora = chegou a hora de hoje
+   aguardando = ainda vai chegar hoje · futuro = outro dia         */
+const slotStatus = f => {
+  if (!f) return "futuro";
+  if (f.feito) return "feito";
+  const hoje = todayISO();
+  if (f.data < hoje) return "atrasado";
+  if (f.data > hoje) return "futuro";
+  return agoraHM() >= slotDe(f) ? "agora" : "aguardando";
+};
+const SLOT_COR = {
+  atrasado: "#B4472E",
+  agora: "#9C7C3C",
+  aguardando: "#3E6C99",
+  futuro: "#6F7A87",
+  feito: "#4F7A5C"
+};
+const SLOT_ROTULO = {
+  atrasado: "atrasado",
+  agora: "cobrar agora",
+  aguardando: "ainda hoje",
+  futuro: "programado",
+  feito: "registrado"
+};
+const chaveFup = f => `${f.data}#${slotDe(f)}`;
 const followStatus = iso => {
   if (!iso) return "futuro";
   const d = diffDays(iso);
@@ -647,17 +701,23 @@ const proximoDiaUtil = iso => {
   return d;
 };
 
-/* D1 = um dia depois do início do ciclo (não o próprio dia). */
+/* D1 = primeiro dia depois do início do ciclo. Os três toques de um
+   mesmo dia dividem a data e mudam apenas no horário.              */
+const datasDaCadencia = inicioISO => {
+  const datas = [];
+  let d = inicioISO;
+  for (let i = 0; i < CADENCIA_DIAS; i++) {
+    d = CADENCIA_SO_DIA_UTIL ? proximoDiaUtil(addDays(d, 1)) : addDays(d, 1);
+    datas.push(d);
+  }
+  return datas;
+};
 const gerarFollowups = inicioISO => {
-  let anterior = null;
-  return CADENCIA.map(n => {
-    let data = proximoDiaUtil(addDays(inicioISO, n));
-    /* dois contatos empurrados para o mesmo dia viram um só na prática:
-       o seguinte anda para o próximo dia útil. */
-    if (anterior && data <= anterior) data = proximoDiaUtil(addDays(anterior, 1));
-    anterior = data;
-    return {
-      dia: n,
+  const out = [];
+  datasDaCadencia(inicioISO).forEach((data, i) => {
+    SLOTS.forEach(slot => out.push({
+      dia: i + 1,
+      slot,
       data,
       feito: false,
       feitoEm: null,
@@ -665,32 +725,46 @@ const gerarFollowups = inicioISO => {
       semResposta: false,
       canalOutro: "",
       nota: ""
-    };
+    }));
   });
+  return out;
 };
 
-/* Reposiciona contatos ainda em aberto que caíram em dia não útil. */
+/* Cadência antiga: seis contatos sem horário (D1, D3, D5, D7, D15, D28). */
+const ehCadenciaAntiga = fups => Array.isArray(fups) && fups.length > 0 && fups.every(f => !f.slot);
+
+/* Reposiciona contatos em aberto que caíram em dia não útil.
+   Move o dia inteiro — os três toques andam juntos, nunca sozinhos. */
 const ajustarParaDiasUteis = fups => {
-  if (!Array.isArray(fups)) return {
+  if (!Array.isArray(fups) || !CADENCIA_SO_DIA_UTIL) return {
     lista: fups,
     mudou: 0
   };
+  const novaData = {};
   let mudou = 0,
-    anterior = null;
-  const lista = fups.map(f => {
-    if (f.feito) {
-      anterior = f.data;
-      return f;
+    ultima = null;
+  [...new Set(fups.map(f => f.data))].sort().forEach(data => {
+    const temAberto = fups.some(f => f.data === data && !f.feito);
+    if (!temAberto) {
+      ultima = data;
+      return;
     }
-    let data = proximoDiaUtil(f.data);
-    if (anterior && data <= anterior) data = proximoDiaUtil(addDays(anterior, 1));
-    anterior = data;
-    if (data !== f.data) mudou++;
-    return {
-      ...f,
-      data
-    };
+    let d = proximoDiaUtil(data);
+    if (ultima && d <= ultima) d = proximoDiaUtil(addDays(ultima, 1));
+    ultima = d;
+    if (d !== data) {
+      novaData[data] = d;
+      mudou++;
+    }
   });
+  if (!mudou) return {
+    lista: fups,
+    mudou: 0
+  };
+  const lista = fups.map(f => !f.feito && novaData[f.data] ? {
+    ...f,
+    data: novaData[f.data]
+  } : f);
   return {
     lista,
     mudou
@@ -707,7 +781,28 @@ const contarNaoUteis = clientes => {
 };
 const proximoFollowup = fups => {
   if (!Array.isArray(fups)) return null;
-  return fups.filter(f => !f.feito).sort((a, b) => a.data < b.data ? -1 : 1)[0] || null;
+  return fups.filter(f => !f.feito).sort((a, b) => chaveFup(a).localeCompare(chaveFup(b)))[0] || null;
+};
+
+/* Resumo por dia: usado na tela do cliente e na fila. */
+const agruparPorDia = fups => {
+  const mapa = new Map();
+  (Array.isArray(fups) ? fups : []).forEach((f, i) => {
+    const k = `${f.dia}|${f.data}`;
+    if (!mapa.has(k)) mapa.set(k, {
+      dia: f.dia,
+      data: f.data,
+      itens: []
+    });
+    mapa.get(k).itens.push({
+      ...f,
+      indice: i
+    });
+  });
+  return [...mapa.values()].sort((a, b) => a.data.localeCompare(b.data) || a.dia - b.dia).map(g => ({
+    ...g,
+    itens: g.itens.sort((x, y) => slotDe(x).localeCompare(slotDe(y)))
+  }));
 };
 
 /* --------------------------- ícones ------------------------------ */
@@ -822,6 +917,13 @@ const Icon = {
   })),
   menu: p => /*#__PURE__*/React.createElement(Ic, p, /*#__PURE__*/React.createElement("path", {
     d: "M3 6h18M3 12h18M3 18h18"
+  })),
+  upload: p => /*#__PURE__*/React.createElement(Ic, p, /*#__PURE__*/React.createElement("path", {
+    d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"
+  }), /*#__PURE__*/React.createElement("path", {
+    d: "M7 9l5-5 5 5"
+  }), /*#__PURE__*/React.createElement("path", {
+    d: "M12 4v12"
   }))
 };
 
@@ -1657,15 +1759,18 @@ function Workspace({
   const processos = useColecao("processos");
   const eventos = useColecao("eventos");
 
-  /* quantos contatos estão vencidos ou marcados para hoje */
+  /* contatos vencidos ou com a hora já batida — o relógio entra na
+     conta para o número virar sozinho às 8h, 13h e 17h */
+  const tique = useRelogio();
   const pendentes = useMemo(() => {
-    const f = filaDoDia(clientes.itens);
+    const f = filaDoDia(clientes.itens, "todos");
     return {
       atrasados: f.atrasados.length,
-      hoje: f.hoje.length,
-      total: f.atrasados.length + f.hoje.length
+      agora: f.vencidosHoje,
+      hoje: f.hojeTotal,
+      total: f.atrasados.length + f.vencidosHoje
     };
-  }, [clientes.itens]);
+  }, [clientes.itens, tique]);
 
   /* o contador também vai para o título da aba do navegador */
   useEffect(() => {
@@ -1963,15 +2068,18 @@ function Painel({
   } = ctx;
   const hoje = todayISO();
   const emAberto = clientes.itens.filter(c => !c.desfecho);
+  useRelogio();
   const fups = [];
   emAberto.forEach(c => {
-    const p = proximoFollowup(c.followups);
-    if (p && diffDays(p.data) <= 0) fups.push({
-      cliente: c,
-      fup: p
+    (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
+      const e = slotStatus(f);
+      if (e === "atrasado" || e === "agora") fups.push({
+        cliente: c,
+        fup: f
+      });
     });
   });
-  fups.sort((a, b) => a.fup.data < b.fup.data ? -1 : 1);
+  fups.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
   const prazos = [];
   processos.itens.forEach(pr => {
     (pr.prazos || []).forEach((pz, i) => {
@@ -1991,7 +2099,7 @@ function Painel({
     v: emAberto.length,
     cor: C.ink
   }, {
-    r: "Contatos para hoje",
+    r: "Contatos a fazer agora",
     v: fups.length,
     cor: fups.length ? C.late : C.ok
   }, {
@@ -2083,7 +2191,7 @@ function Painel({
     cliente,
     fup
   }) => /*#__PURE__*/React.createElement("button", {
-    key: cliente.id + fup.dia,
+    key: cliente.id + chaveFup(fup),
     onClick: () => irPara("followup"),
     style: {
       width: "100%",
@@ -2114,9 +2222,9 @@ function Painel({
       fontSize: 11.5,
       color: C.muted
     }
-  }, "D", fup.dia, " · ", cliente.telefone || cliente.email || "sem contato")), /*#__PURE__*/React.createElement(Tag, {
-    cor: statusCor(followStatus(fup.data))
-  }, followStatus(fup.data) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "hoje")))), /*#__PURE__*/React.createElement(Card, {
+  }, "D", fup.dia, " · ", slotHora(fup), " · ", cliente.telefone || cliente.email || "sem contato")), /*#__PURE__*/React.createElement(Tag, {
+    cor: SLOT_COR[slotStatus(fup)]
+  }, slotStatus(fup) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora")))), /*#__PURE__*/React.createElement(Card, {
     style: {
       padding: 18
     }
@@ -2308,6 +2416,7 @@ function Clientes({
   const [editando, setEditando] = useState(null);
   const [novo, setNovo] = useState(false);
   const [detalhe, setDetalhe] = useState(null);
+  const [importando, setImportando] = useState(false);
   const lista = useMemo(() => {
     let l = clientes.itens;
     if (filtro === "abertos") l = l.filter(c => !c.desfecho);
@@ -2344,6 +2453,12 @@ function Clientes({
       marginRight: "auto"
     }
   }, clientes.itens.length, " no total"), podeCriar && /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    icon: /*#__PURE__*/React.createElement(Icon.upload, {
+      size: 16
+    }),
+    onClick: () => setImportando(true)
+  }, "Importar planilha"), podeCriar && /*#__PURE__*/React.createElement(Btn, {
     kind: "brass",
     icon: /*#__PURE__*/React.createElement(Icon.plus, {
       size: 16
@@ -2385,10 +2500,20 @@ function Clientes({
   }, "Carregando…") : lista.length === 0 ? /*#__PURE__*/React.createElement(Vazio, {
     titulo: "Nenhum cliente por aqui",
     texto: busca ? "Nada encontrado com esse termo." : "Cadastre o primeiro cliente para começar a acompanhar a cadência de contato.",
-    acao: podeCriar && !busca ? /*#__PURE__*/React.createElement(Btn, {
+    acao: podeCriar && !busca ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        justifyContent: "center",
+        flexWrap: "wrap"
+      }
+    }, /*#__PURE__*/React.createElement(Btn, {
       kind: "brass",
       onClick: () => setNovo(true)
-    }, "Cadastrar cliente") : null
+    }, "Cadastrar cliente"), /*#__PURE__*/React.createElement(Btn, {
+      kind: "ghost",
+      onClick: () => setImportando(true)
+    }, "Importar planilha")) : null
   }) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
@@ -2408,6 +2533,9 @@ function Clientes({
       setNovo(false);
       setEditando(null);
     }
+  }), importando && /*#__PURE__*/React.createElement(ImportarClientes, {
+    ctx: ctx,
+    onFechar: () => setImportando(false)
   }), detalhe && /*#__PURE__*/React.createElement(ClienteDetalhe, {
     ctx: ctx,
     id: detalhe,
@@ -2469,7 +2597,7 @@ function LinhaCliente({
     cor: ESTAGIO_COR[c.estagio] || C.muted
   }, c.estagio || "Novo lead"), !c.desfecho && prox && /*#__PURE__*/React.createElement(Tag, {
     cor: statusCor(st)
-  }, "D", prox.dia, " · ", st === "atrasado" ? `${Math.abs(diffDays(prox.data))}d atrás` : st === "hoje" ? "hoje" : fmtBR(prox.data)));
+  }, "D", prox.dia, " · ", slotHora(prox), " · ", st === "atrasado" ? `${Math.abs(diffDays(prox.data))}d atrás` : st === "hoje" ? "hoje" : fmtBR(prox.data)));
 }
 
 /* ------------------ controle de inatividade ---------------------- */
@@ -2653,7 +2781,7 @@ function ClienteForm({
   return /*#__PURE__*/React.createElement(Modal, {
     titulo: ed ? "Editar cliente" : "Novo cliente",
     largura: 860,
-    sub: ed ? f.nome : "A cadência de contato começa no dia seguinte ao cadastro",
+    sub: ed ? f.nome : `A cadência começa no dia seguinte: ${CADENCIA_RESUMO}`,
     onFechar: onFechar,
     rodape: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Btn, {
       kind: "ghost",
@@ -2739,7 +2867,7 @@ function ClienteForm({
     }))
   }), !ed && /*#__PURE__*/React.createElement(Campo, {
     label: "Início da cadência",
-    hint: "D1, D3, D5, D7, D15 e D28 contados a partir desta data."
+    hint: `${CADENCIA_RESUMO}. D1 é o primeiro dia útil depois desta data.`
   }, /*#__PURE__*/React.createElement(Inp, {
     type: "date",
     value: f.inicioCadencia,
@@ -2761,6 +2889,792 @@ function ClienteForm({
   }, erro)));
 }
 
+/* ---------------- importação de planilha -------------------------
+   Aceita .csv, .txt, .tsv, .xlsx e .xls, e também colagem direta do
+   Excel ou do Google Planilhas.
+
+   Dois detalhes que costumam estragar importação no Brasil e que
+   estão tratados aqui:
+   1. o Excel em português salva CSV com ponto e vírgula, não vírgula;
+   2. salva em Windows-1252, então ler tudo como UTF-8 transforma
+      "José" em caractere quebrado. Tentamos UTF-8 e caímos para
+      Windows-1252 quando a leitura falha.                            */
+
+const semAcento = t => String(t == null ? "" : t).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+const decodificarBytes = buffer => {
+  const bytes = new Uint8Array(buffer);
+  try {
+    return new TextDecoder("utf-8", {
+      fatal: true
+    }).decode(bytes).replace(/^\uFEFF/, "");
+  } catch (e) {
+    return new TextDecoder("windows-1252").decode(bytes).replace(/^\uFEFF/, "");
+  }
+};
+const detectarSeparador = texto => {
+  const linha = texto.split(/\r?\n/).find(l => l.trim()) || "";
+  let melhor = ";",
+    max = 0;
+  [";", ",", "\t", "|"].forEach(sep => {
+    const n = linha.split(sep).length - 1;
+    if (n > max) {
+      max = n;
+      melhor = sep;
+    }
+  });
+  return max === 0 ? ";" : melhor;
+};
+
+/* Parser próprio: campo entre aspas pode conter separador e quebra de
+   linha, e "" dentro das aspas é uma aspa literal. */
+const parseDelimitado = (texto, sep) => {
+  const linhas = [];
+  let campo = "",
+    linha = [],
+    dentroDeAspas = false;
+  for (let i = 0; i < texto.length; i++) {
+    const ch = texto[i];
+    if (dentroDeAspas) {
+      if (ch === '"') {
+        if (texto[i + 1] === '"') {
+          campo += '"';
+          i++;
+        } else dentroDeAspas = false;
+      } else campo += ch;
+    } else if (ch === '"') dentroDeAspas = true;else if (ch === sep) {
+      linha.push(campo);
+      campo = "";
+    } else if (ch === "\n") {
+      linha.push(campo);
+      linhas.push(linha);
+      linha = [];
+      campo = "";
+    } else if (ch !== "\r") campo += ch;
+  }
+  if (campo !== "" || linha.length) {
+    linha.push(campo);
+    linhas.push(linha);
+  }
+  return linhas.filter(l => l.some(c => String(c).trim() !== ""));
+};
+
+/* SheetJS só é baixado se o arquivo for mesmo .xlsx. Quem manda CSV
+   não paga esse download — e a importação por CSV continua funcionando
+   sem internet além da que o Zelo já usa. */
+let _xlsxPromise = null;
+const carregarXLSX = () => {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!_xlsxPromise) _xlsxPromise = new Promise((ok, falha) => {
+    const el = document.createElement("script");
+    el.src = "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js";
+    el.onload = () => ok(window.XLSX);
+    el.onerror = () => {
+      _xlsxPromise = null;
+      falha(new Error("falha ao carregar o leitor de xlsx"));
+    };
+    document.head.appendChild(el);
+  });
+  return _xlsxPromise;
+};
+const lerArquivoPlanilha = async arquivo => {
+  const nome = String(arquivo.name || "").toLowerCase();
+  const buffer = await arquivo.arrayBuffer();
+  if (/\.(xlsx|xlsm|xltx|xls)$/.test(nome)) {
+    const XLSX = await carregarXLSX();
+    const wb = XLSX.read(buffer, {
+      type: "array"
+    });
+    const primeira = wb.Sheets[wb.SheetNames[0]];
+    if (!primeira) return [];
+    return XLSX.utils.sheet_to_json(primeira, {
+      header: 1,
+      raw: false,
+      defval: ""
+    }).map(l => (Array.isArray(l) ? l : []).map(c => String(c == null ? "" : c))).filter(l => l.some(c => c.trim() !== ""));
+  }
+  const texto = decodificarBytes(buffer);
+  return parseDelimitado(texto, detectarSeparador(texto));
+};
+
+/* Campos que o Zelo sabe receber. "apelidos" é o que a planilha do
+   escritório costuma usar como título de coluna. */
+const CAMPOS_IMPORT = [{
+  id: "nome",
+  rotulo: "Nome",
+  obrig: true,
+  apelidos: ["nome", "cliente", "nome completo", "nome do cliente", "razao social", "lead", "contato"]
+}, {
+  id: "telefone",
+  rotulo: "Telefone / WhatsApp",
+  apelidos: ["telefone", "celular", "whatsapp", "whats", "fone", "tel", "zap", "numero"]
+}, {
+  id: "email",
+  rotulo: "E-mail",
+  apelidos: ["email", "e mail", "mail", "correio"]
+}, {
+  id: "cpf",
+  rotulo: "CPF / CNPJ",
+  apelidos: ["cpf", "cnpj", "cpf cnpj", "documento", "doc"]
+}, {
+  id: "area",
+  rotulo: "Área do caso",
+  apelidos: ["area", "area do caso", "assunto", "materia", "tipo", "tipo de caso", "especialidade", "ramo"]
+}, {
+  id: "origem",
+  rotulo: "Origem do lead",
+  apelidos: ["origem", "como conheceu", "como chegou", "canal", "fonte", "indicacao", "indicado por"]
+}, {
+  id: "estagio",
+  rotulo: "Etapa do funil",
+  apelidos: ["etapa", "estagio", "status", "situacao", "fase", "funil"]
+}, {
+  id: "valorProposta",
+  rotulo: "Valor da proposta",
+  apelidos: ["valor", "proposta", "valor da proposta", "honorarios", "ticket", "preco"]
+}, {
+  id: "observacoes",
+  rotulo: "Observações",
+  apelidos: ["observacao", "observacoes", "obs", "anotacoes", "anotacao", "detalhes", "descricao", "historico", "resumo"]
+}];
+const adivinharColunas = cabecalho => {
+  const norm = cabecalho.map(semAcento);
+  const mapa = {},
+    usadas = new Set();
+  CAMPOS_IMPORT.forEach(campo => {
+    let achou = -1;
+    campo.apelidos.forEach(ap => {
+      if (achou >= 0) return;
+      const i = norm.findIndex((h, idx) => !usadas.has(idx) && h === ap);
+      if (i >= 0) achou = i;
+    });
+    if (achou < 0) campo.apelidos.forEach(ap => {
+      if (achou >= 0 || ap.length < 3) return;
+      const i = norm.findIndex((h, idx) => !usadas.has(idx) && h.includes(ap));
+      if (i >= 0) achou = i;
+    });
+    if (achou >= 0) {
+      mapa[campo.id] = achou;
+      usadas.add(achou);
+    } else mapa[campo.id] = -1;
+  });
+  return mapa;
+};
+
+/* "Trabalhista", "trabalhista ", "TRABALHISTA" caem todos na mesma
+   opção. O que não bate em nada é tratado adiante, campo a campo. */
+const casarOpcao = (valor, opcoes) => {
+  const v = semAcento(valor);
+  if (!v) return null;
+  return opcoes.find(o => semAcento(o) === v) || (v.length >= 3 ? opcoes.find(o => semAcento(o).includes(v) || v.includes(semAcento(o))) : null) || null;
+};
+
+/* "R$ 1.200,00" -> 1200. A planilha pode vir com ponto de milhar,
+   vírgula decimal, símbolo e espaço. */
+const valorParaReais = bruto => {
+  let t = String(bruto == null ? "" : bruto).replace(/[^\d.,-]/g, "").trim();
+  if (!t) return "";
+  if (t.includes(",")) {
+    /* vírgula manda: o ponto que sobrar é separador de milhar */
+    t = t.replace(/\./g, "").replace(",", ".");
+  } else if ((t.match(/\./g) || []).length > 1 || /\.\d{3}$/.test(t)) {
+    /* "1.500" e "1.200.000" são milhar, não decimal — a planilha do
+       escritório escreve valor cheio, não centavos com três casas. */
+    t = t.replace(/\./g, "");
+  }
+  const n = Number(t);
+  return isFinite(n) && n > 0 ? Math.round(n) : "";
+};
+
+/* Data em dd/mm/aaaa, dd-mm-aaaa ou aaaa-mm-dd. */
+const dataParaISO = bruto => {
+  const t = String(bruto == null ? "" : bruto).trim();
+  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) {
+    const ano = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${ano}-${pad(Number(m[2]))}-${pad(Number(m[1]))}`;
+  }
+  return "";
+};
+
+/* Duas fichas são a mesma pessoa se batem o nome, ou o telefone, ou o
+   e-mail. Reimportar a planilha inteira por engano não deve duplicar
+   a base. */
+const chavesDeIdentidade = c => {
+  const ch = [];
+  if (String(c.nome || "").trim()) ch.push("n:" + semAcento(c.nome));
+  const tel = String(c.telefone || "").replace(/\D/g, "");
+  if (tel.length >= 8) ch.push("t:" + tel.slice(-8));
+  const mail = semAcento(c.email);
+  if (mail.includes("@")) ch.push("e:" + mail);
+  return ch;
+};
+const CSV_MODELO = ["Nome;Telefone;E-mail;CPF/CNPJ;Área;Origem;Etapa;Valor;Observações", "Maria Aparecida da Silva;(11) 90000-0000;maria@email.com;;Trabalhista;Indicação;Novo lead;3500;Reclamação trabalhista, audiência marcada", "João Carlos Pereira;(11) 91111-1111;joao@email.com;;Família;Instagram;Em negociação;0;Divórcio consensual"].join("\n");
+function ImportarClientes({
+  ctx,
+  onFechar
+}) {
+  const {
+    clientes,
+    perfil
+  } = ctx;
+  const [etapa, setEtapa] = useState("arquivo"); // arquivo | mapa | revisao | gravando | fim
+  const [erro, setErro] = useState("");
+  const [lendo, setLendo] = useState(false);
+  const [colado, setColado] = useState("");
+  const [linhas, setLinhas] = useState([]);
+  const [temCabecalho, setTemCabecalho] = useState(true);
+  const [mapa, setMapa] = useState({});
+  const [pularDuplicados, setPularDuplicados] = useState(true);
+  const [modoCadencia, setModoCadencia] = useState("nao"); // nao | hoje | data
+  const [dataCadencia, setDataCadencia] = useState(todayISO());
+  const [progresso, setProgresso] = useState(0);
+  const [resultado, setResultado] = useState(null);
+  const inputRef = useRef(null);
+  const colunas = useMemo(() => {
+    if (!linhas.length) return [];
+    const largura = Math.max(...linhas.map(l => l.length));
+    if (temCabecalho) {
+      return Array.from({
+        length: largura
+      }, (_, i) => String(linhas[0][i] || "").trim() || `Coluna ${i + 1}`);
+    }
+    return Array.from({
+      length: largura
+    }, (_, i) => `Coluna ${i + 1}`);
+  }, [linhas, temCabecalho]);
+  const corpo = useMemo(() => temCabecalho ? linhas.slice(1) : linhas, [linhas, temCabecalho]);
+  const receberLinhas = ls => {
+    if (!ls.length) {
+      setErro("A planilha veio vazia — nenhuma linha com conteúdo.");
+      return;
+    }
+    setLinhas(ls);
+    setMapa(adivinharColunas((ls[0] || []).map(x => String(x || ""))));
+    setErro("");
+    setEtapa("mapa");
+  };
+  const escolherArquivo = async arquivo => {
+    if (!arquivo) return;
+    setLendo(true);
+    setErro("");
+    try {
+      receberLinhas(await lerArquivoPlanilha(arquivo));
+    } catch (e) {
+      setErro("Não consegui ler este arquivo. Se for .xlsx, confira a internet — o leitor de Excel é baixado na hora. Salvar como CSV também resolve.");
+    }
+    setLendo(false);
+  };
+  const usarColado = () => {
+    const t = colado.trim();
+    if (!t) {
+      setErro("Cole o conteúdo da planilha na caixa acima.");
+      return;
+    }
+    receberLinhas(parseDelimitado(t, detectarSeparador(t)));
+  };
+  const baixarModelo = () => {
+    const blob = new Blob(["\uFEFF" + CSV_MODELO], {
+      type: "text/csv;charset=utf-8"
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "modelo-clientes-zelo.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  };
+
+  /* Cada linha vira uma prévia com status. Nada é gravado aqui. */
+  const previa = useMemo(() => {
+    if (etapa === "arquivo") return [];
+    const existentes = new Set();
+    clientes.itens.forEach(c => chavesDeIdentidade(c).forEach(k => existentes.add(k)));
+    const vistas = new Set();
+    return corpo.map((linha, i) => {
+      const pega = id => {
+        const idx = mapa[id];
+        return idx >= 0 ? String(linha[idx] == null ? "" : linha[idx]).trim() : "";
+      };
+      const nome = pega("nome");
+      const bruto = {
+        nome,
+        telefone: pega("telefone"),
+        email: pega("email"),
+        cpf: pega("cpf"),
+        area: pega("area"),
+        origem: pega("origem"),
+        estagio: pega("estagio"),
+        valorProposta: pega("valorProposta"),
+        observacoes: pega("observacoes")
+      };
+      if (!nome) return {
+        i,
+        bruto,
+        status: "erro",
+        motivo: "sem nome"
+      };
+      const chaves = chavesDeIdentidade(bruto);
+      const dup = chaves.some(k => existentes.has(k) || vistas.has(k));
+      chaves.forEach(k => vistas.add(k));
+      const area = casarOpcao(bruto.area, AREAS);
+      const estagio = casarOpcao(bruto.estagio, ESTAGIOS) || "Novo lead";
+      const origemPadrao = casarOpcao(bruto.origem, ORIGENS);
+
+      /* Origem é obrigatória no Zelo porque alimenta o relatório. O que
+         a planilha trouxer e não bater com a lista entra como "Outro"
+         com o texto original preservado. */
+      const origem = origemPadrao || "Outro";
+      const origemOutro = origemPadrao ? "" : bruto.origem || "Importado da planilha";
+
+      /* Área que não bate com a lista não é jogada fora: vira anotação. */
+      const notas = [bruto.observacoes];
+      if (bruto.area && !area) notas.push(`Área na planilha: ${bruto.area}`);
+      const dados = {
+        nome,
+        telefone: maskTel(bruto.telefone),
+        email: bruto.email,
+        cpf: bruto.cpf,
+        area: area || "",
+        origem,
+        origemOutro,
+        estagio,
+        valorProposta: valorParaReais(bruto.valorProposta),
+        observacoes: notas.filter(Boolean).join("\n")
+      };
+      return {
+        i,
+        bruto,
+        dados,
+        status: dup ? "duplicado" : "novo"
+      };
+    });
+  }, [corpo, mapa, etapa, clientes.itens]);
+  const novos = previa.filter(r => r.status === "novo");
+  const duplicados = previa.filter(r => r.status === "duplicado");
+  const invalidos = previa.filter(r => r.status === "erro");
+  const aGravar = pularDuplicados ? novos : novos.concat(duplicados);
+  const nomeMapeado = mapa.nome >= 0;
+  const gravar = async () => {
+    setEtapa("gravando");
+    setProgresso(0);
+    const inicio = modoCadencia === "hoje" ? todayISO() : modoCadencia === "data" ? dataCadencia || todayISO() : null;
+    let ok = 0,
+      falhas = 0;
+    for (let n = 0; n < aGravar.length; n++) {
+      try {
+        await clientes.criar({
+          ...aGravar[n].dados,
+          criadoEm: new Date().toISOString(),
+          criadoPor: perfil.uid,
+          responsavel: perfil.uid,
+          ciclo: 1,
+          inicioCiclo: inicio,
+          followups: inicio ? gerarFollowups(inicio) : [],
+          desfecho: null,
+          historicoCiclos: [],
+          importado: true
+        });
+        ok++;
+      } catch (e) {
+        falhas++;
+      }
+      setProgresso(n + 1);
+    }
+    setResultado({
+      ok,
+      falhas
+    });
+    setEtapa("fim");
+  };
+  const CorStatus = {
+    novo: C.ok,
+    duplicado: C.brass,
+    erro: C.late
+  };
+  const rodape = etapa === "arquivo" ? /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: onFechar
+  }, "Cancelar") : etapa === "mapa" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: () => {
+      setEtapa("arquivo");
+      setLinhas([]);
+    }
+  }, "Voltar"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    disabled: !nomeMapeado,
+    onClick: () => setEtapa("revisao")
+  }, "Revisar")) : etapa === "revisao" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: () => setEtapa("mapa")
+  }, "Voltar"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    disabled: aGravar.length === 0,
+    onClick: gravar
+  }, "Importar ", aGravar.length, " ", aGravar.length === 1 ? "cliente" : "clientes")) : etapa === "fim" ? /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    onClick: onFechar
+  }, "Fechar") : null;
+  return /*#__PURE__*/React.createElement(Modal, {
+    titulo: "Importar clientes de planilha",
+    largura: 980,
+    sub: "Traga a base que o escritório controlava na planilha. Nada é gravado antes da revisão.",
+    onFechar: etapa === "gravando" ? () => {} : onFechar,
+    rodape: rodape
+  }, etapa === "arquivo" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      border: `1px dashed ${C.line}`,
+      borderRadius: 12,
+      padding: "26px 18px",
+      textAlign: "center",
+      background: "#FAFAF8"
+    },
+    onDragOver: e => e.preventDefault(),
+    onDrop: e => {
+      e.preventDefault();
+      escolherArquivo(e.dataTransfer.files[0]);
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600,
+      marginBottom: 6
+    }
+  }, "Arraste a planilha aqui ou escolha o arquivo"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 14
+    }
+  }, ".xlsx, .xls, .csv ou .txt · a primeira aba da planilha é a que vale"), /*#__PURE__*/React.createElement("input", {
+    ref: inputRef,
+    type: "file",
+    accept: ".csv,.txt,.tsv,.xlsx,.xlsm,.xltx,.xls",
+    style: {
+      display: "none"
+    },
+    onChange: e => escolherArquivo(e.target.files[0])
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      justifyContent: "center",
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    disabled: lendo,
+    onClick: () => inputRef.current && inputRef.current.click()
+  }, lendo ? "Lendo…" : "Escolher arquivo"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: baixarModelo
+  }, "Baixar modelo em CSV"))), /*#__PURE__*/React.createElement(Campo, {
+    label: "Ou cole direto da planilha",
+    hint: "Selecione as células no Excel ou no Google Planilhas, copie e cole aqui. Inclua a linha de títulos."
+  }, /*#__PURE__*/React.createElement(Txt, {
+    value: colado,
+    onChange: e => setColado(e.target.value),
+    style: {
+      minHeight: 110,
+      fontFamily: "ui-monospace, monospace",
+      fontSize: 12.5
+    },
+    placeholder: "Nome\tTelefone\tE-mail\nMaria Silva\t(11) 90000-0000\tmaria@email.com"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: usarColado
+  }, "Usar o texto colado")), erro && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.late,
+      background: "#B4472E12",
+      padding: "9px 12px",
+      borderRadius: 9,
+      lineHeight: 1.5
+    }
+  }, erro)), etapa === "mapa" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      lineHeight: 1.55
+    }
+  }, corpo.length, " ", corpo.length === 1 ? "linha lida" : "linhas lidas", " ·", " ", colunas.length, " ", colunas.length === 1 ? "coluna" : "colunas", ". Confira o encaixe abaixo — chutei pelos títulos, mas quem manda é você."), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: temCabecalho,
+    onChange: e => {
+      setTemCabecalho(e.target.checked);
+      setMapa(adivinharColunas(e.target.checked ? (linhas[0] || []).map(x => String(x || "")) : []));
+    }
+  }), "A primeira linha é o título das colunas"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 12
+    }
+  }, CAMPOS_IMPORT.map(campo => /*#__PURE__*/React.createElement("div", {
+    key: campo.id,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600,
+      width: 170
+    }
+  }, campo.rotulo, campo.obrig && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.late
+    }
+  }, " *")), /*#__PURE__*/React.createElement(Sel, {
+    value: mapa[campo.id],
+    style: {
+      maxWidth: 280
+    },
+    onChange: e => setMapa(m => ({
+      ...m,
+      [campo.id]: Number(e.target.value)
+    }))
+  }, /*#__PURE__*/React.createElement("option", {
+    value: -1
+  }, "— não importar —"), colunas.map((col, i) => /*#__PURE__*/React.createElement("option", {
+    key: i,
+    value: i
+  }, col))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      flex: 1,
+      minWidth: 140
+    }
+  }, mapa[campo.id] >= 0 && corpo[0] ? `ex.: ${String(corpo[0][mapa[campo.id]] || "").slice(0, 40) || "(vazio)"}` : "")))), !nomeMapeado && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.late,
+      background: "#B4472E12",
+      padding: "9px 12px",
+      borderRadius: 9
+    }
+  }, "Escolha qual coluna tem o nome do cliente. Sem nome, a ficha não existe.")), etapa === "revisao" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(Tag, {
+    cor: C.ok,
+    forte: true
+  }, novos.length, " novos"), duplicados.length > 0 && /*#__PURE__*/React.createElement(Tag, {
+    cor: C.brass,
+    forte: true
+  }, duplicados.length, " já existem"), invalidos.length > 0 && /*#__PURE__*/React.createElement(Tag, {
+    cor: C.late,
+    forte: true
+  }, invalidos.length, " sem nome")), duplicados.length > 0 && /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "flex-start",
+      gap: 8,
+      fontSize: 13,
+      lineHeight: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: pularDuplicados,
+    style: {
+      marginTop: 3
+    },
+    onChange: e => setPularDuplicados(e.target.checked)
+  }), /*#__PURE__*/React.createElement("span", null, "Pular quem já está na base. Comparo por nome, telefone e e-mail — desmarque só se forem mesmo pessoas diferentes com o mesmo nome.")), /*#__PURE__*/React.createElement(Campo, {
+    label: "Cadência de contato para os importados",
+    hint: "Cada dia tem três toques. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato."
+  }, /*#__PURE__*/React.createElement(Sel, {
+    value: modoCadencia,
+    onChange: e => setModoCadencia(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "nao"
+  }, "Não iniciar agora — cadastrar só as fichas"), /*#__PURE__*/React.createElement("option", {
+    value: "hoje"
+  }, "Começar hoje, para todos"), /*#__PURE__*/React.createElement("option", {
+    value: "data"
+  }, "Começar em uma data específica"))), modoCadencia === "data" && /*#__PURE__*/React.createElement(Campo, {
+    label: "Data de início",
+    hint: `${CADENCIA_RESUMO}. D1 é o primeiro dia útil depois desta data.`
+  }, /*#__PURE__*/React.createElement(Inp, {
+    type: "date",
+    value: dataCadencia,
+    style: {
+      maxWidth: 220
+    },
+    onChange: e => setDataCadencia(e.target.value)
+  })), modoCadencia !== "nao" && aGravar.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.brass,
+      background: "#9C7C3C12",
+      padding: "9px 12px",
+      borderRadius: 9,
+      lineHeight: 1.55
+    }
+  }, "Isso cria ", aGravar.length * CADENCIA_DIAS * SLOTS.length, " contatos na fila (", aGravar.length, " × ", CADENCIA_DIAS, " dias × ", SLOTS.length, " toques). Se a ideia é retomar aos poucos, cadastre sem cadência e ligue cliente a cliente na ficha."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      border: `1px solid ${C.lineSoft}`,
+      borderRadius: 12,
+      overflow: "auto",
+      maxHeight: 320
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: "#F5F6F4"
+    }
+  }, ["", "Nome", "Telefone", "Área", "Origem", "Etapa", "Valor"].map((h, i) => /*#__PURE__*/React.createElement("th", {
+    key: i,
+    style: {
+      textAlign: "left",
+      padding: "8px 10px",
+      fontWeight: 600,
+      color: C.inkSoft,
+      whiteSpace: "nowrap"
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, previa.slice(0, 60).map(r => /*#__PURE__*/React.createElement("tr", {
+    key: r.i,
+    style: {
+      borderTop: `1px solid ${C.lineSoft}`,
+      opacity: r.status === "erro" || r.status === "duplicado" && pularDuplicados ? .5 : 1
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, /*#__PURE__*/React.createElement(Tag, {
+    cor: CorStatus[r.status]
+  }, r.status === "novo" ? "novo" : r.status === "duplicado" ? "já existe" : "sem nome")), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.bruto.nome || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados && r.dados.telefone || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados && r.dados.area || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados ? rotulo(r.dados.origem, r.dados.origemOutro) : "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados && r.dados.estagio || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px"
+    }
+  }, r.dados ? brl(r.dados.valorProposta) : "—")))))), previa.length > 60 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted
+    }
+  }, "Mostrando as 60 primeiras de ", previa.length, " linhas. A importação leva todas.")), etapa === "gravando" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "24px 4px",
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      marginBottom: 8
+    }
+  }, "Gravando ", progresso, " de ", aGravar.length, "…"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 8,
+      background: C.lineSoft,
+      borderRadius: 99,
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: "100%",
+      background: C.brass,
+      borderRadius: 99,
+      width: `${aGravar.length ? progresso / aGravar.length * 100 : 0}%`,
+      transition: "width .2s"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginTop: 10
+    }
+  }, "Não feche esta janela até terminar.")), etapa === "fim" && resultado && /*#__PURE__*/React.createElement("div", {
+    style: {
+      padding: "18px 4px",
+      display: "grid",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 18,
+      fontWeight: 700
+    }
+  }, resultado.ok, " ", resultado.ok === 1 ? "cliente importado" : "clientes importados"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, duplicados.length > 0 && pularDuplicados && `${duplicados.length} ${duplicados.length === 1 ? "linha foi pulada por já existir" : "linhas foram puladas por já existirem"} na base. `, invalidos.length > 0 && `${invalidos.length} ${invalidos.length === 1 ? "linha ficou de fora por não ter nome" : "linhas ficaram de fora por não terem nome"}. `, modoCadencia === "nao" ? "As fichas entraram sem cadência: abra o cliente e use “Iniciar cadência” quando for retomar o contato." : "A cadência já está valendo — confira a aba Follow-up."), resultado.falhas > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.late,
+      background: "#B4472E12",
+      padding: "9px 12px",
+      borderRadius: 9
+    }
+  }, resultado.falhas, " ", resultado.falhas === 1 ? "linha não foi gravada" : "linhas não foram gravadas", ". Pode ter sido queda de conexão — importe a planilha de novo, os que já entraram serão marcados como duplicados.")));
+}
+
 /* ------------------- detalhe do cliente -------------------------- */
 function ClienteDetalhe({
   ctx,
@@ -2778,12 +3692,20 @@ function ClienteDetalhe({
   const [desfechoAberto, setDesfechoAberto] = useState(null); // 'ganho' | 'perdido'
   const [reabrirAberto, setReabrirAberto] = useState(false);
   const [excluirAberto, setExcluirAberto] = useState(false);
+  const [confirmarMigrar, setConfirmarMigrar] = useState(false);
+  const [inicioManual, setInicioManual] = useState(todayISO());
+  const [confirmarInicio, setConfirmarInicio] = useState(false);
+  /* 24 contatos numa tela só é rolagem demais. O padrão mostra os dias
+     que ainda têm toque em aberto; o resto fica a um clique. */
+  const [filtroDias, setFiltroDias] = useState("abertos");
+  const [registro, setRegistro] = useState(null); // { indice, fup }
+  /* Todos os useState ficam acima deste return. Se um hook ficasse
+     abaixo dele, excluir o cliente com a ficha aberta mudaria a
+     quantidade de hooks entre um render e outro e o React quebraria. */
   if (!c) return null;
   const fups = Array.isArray(c.followups) ? c.followups : [];
   const procs = processos.itens.filter(p => p.clienteId === id);
   const podeEditar = P.clientes === "tudo" || P.clientes === "editar";
-  const [registro, setRegistro] = useState(null); // { indice, fup }
-
   const salvarRegistro = (i, dados) => {
     const novos = fups.map((f, k) => k === i ? {
       ...f,
@@ -2808,6 +3730,43 @@ function ClienteDetalhe({
     });
   };
   const encerrado = !!c.desfecho;
+  const antiga = ehCadenciaAntiga(fups);
+  /* Ficha que veio de planilha pode ter sido cadastrada sem cadência. */
+  const semCadencia = fups.length === 0;
+  const diasTodos = agruparPorDia(fups);
+  const diasVisiveis = filtroDias === "todos" ? diasTodos : (() => {
+    const abertos = diasTodos.filter(g => g.itens.some(x => !x.feito));
+    return abertos.length ? abertos : diasTodos;
+  })();
+  const iniciarCadencia = () => {
+    const inicio = inicioManual || todayISO();
+    clientes.atualizar(id, {
+      followups: gerarFollowups(inicio),
+      inicioCiclo: inicio
+    });
+    setConfirmarInicio(false);
+  };
+  const feitosN = fups.filter(f => f.feito).length;
+
+  /* Migração da cadência antiga: nada é apagado. Os contatos já
+     registrados vão para "contatosAnteriores" e a grade nova começa hoje. */
+  const migrarCadencia = () => {
+    const feitos = fups.filter(f => f.feito).map(f => ({
+      dia: f.dia,
+      data: f.data,
+      canal: f.canal || "",
+      canalOutro: f.canalOutro || "",
+      semResposta: !!f.semResposta,
+      nota: f.nota || "",
+      feitoEm: f.feitoEm || null
+    }));
+    clientes.atualizar(id, {
+      followups: gerarFollowups(todayISO()),
+      inicioCiclo: todayISO(),
+      contatosAnteriores: [...(c.contatosAnteriores || []), ...feitos]
+    });
+    setConfirmarMigrar(false);
+  };
   return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Modal, {
     titulo: c.nome,
     largura: 920,
@@ -2935,129 +3894,356 @@ function ClienteDetalhe({
       color: C.muted,
       marginBottom: 12
     }
-  }, "Início em ", fmtBR(c.inicioCiclo), " · D1, D3, D5, D7, D15 e D28"), /*#__PURE__*/React.createElement("div", {
+  }, semCadencia ? "Nenhum contato programado ainda." : /*#__PURE__*/React.createElement(React.Fragment, null, "Início em ", fmtBR(c.inicioCiclo), " · ", antiga ? "cadência antiga: D1, D3, D5, D7, D15 e D28" : CADENCIA_RESUMO, !antiga && ` · ${feitosN} de ${fups.length} registrados`)), semCadencia && !encerrado && podeEditar && /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: "14px 16px",
+      marginBottom: 14,
+      background: "#9C7C3C0F",
+      borderColor: "#9C7C3C33"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13.5,
+      fontWeight: 600,
+      marginBottom: 4
+    }
+  }, "Cadência ainda não iniciada"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      lineHeight: 1.55,
+      marginBottom: 10
+    }
+  }, "Esta ficha foi cadastrada sem cadência", c.importado ? " na importação da planilha" : "", ". Ao iniciar, o Zelo monta ", CADENCIA_RESUMO, " a partir da data escolhida —", " ", CADENCIA_DIAS * SLOTS.length, " contatos, começando no primeiro dia útil seguinte."), confirmarInicio ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement(Inp, {
+    type: "date",
+    value: inicioManual,
+    style: {
+      maxWidth: 180
+    },
+    onChange: e => setInicioManual(e.target.value)
+  }), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: () => setConfirmarInicio(false)
+  }, "Cancelar"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: iniciarCadencia
+  }, "Iniciar")) : /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: () => setConfirmarInicio(true)
+  }, "Iniciar cadência")), antiga && !encerrado && podeEditar && /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: "14px 16px",
+      marginBottom: 14,
+      background: "#9C7C3C0F",
+      borderColor: "#9C7C3C33"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13.5,
+      fontWeight: 600,
+      marginBottom: 4
+    }
+  }, "Este cliente ainda está na cadência antiga"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      lineHeight: 1.55,
+      marginBottom: 10
+    }
+  }, "Atualizar cria a grade nova (", CADENCIA_RESUMO, ") começando hoje. Os contatos já registrados não somem: ficam guardados abaixo, em “Contatos anteriores”."), confirmarMigrar ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12.5,
+      fontWeight: 600,
+      marginRight: "auto"
+    }
+  }, "Confirma recomeçar a cadência hoje?"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: () => setConfirmarMigrar(false)
+  }, "Cancelar"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: migrarCadencia
+  }, "Sim, atualizar")) : /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: () => setConfirmarMigrar(true)
+  }, "Atualizar para a cadência nova")), !semCadencia && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center",
+      marginBottom: 10
+    }
+  }, [["abertos", "Dias em aberto"], ["todos", "Todos os dias"]].map(([v, r]) => {
+    const at = filtroDias === v;
+    return /*#__PURE__*/React.createElement("button", {
+      key: v,
+      onClick: () => setFiltroDias(v),
+      style: {
+        padding: "6px 11px",
+        borderRadius: 8,
+        fontSize: 12,
+        fontWeight: 600,
+        border: `1px solid ${at ? C.brass : C.line}`,
+        background: at ? C.brass : "#fff",
+        color: at ? "#fff" : C.inkSoft,
+        cursor: "pointer"
+      }
+    }, r);
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted
+    }
+  }, diasVisiveis.length, " de ", diasTodos.length, " ", diasTodos.length === 1 ? "dia" : "dias")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
-      gap: 8,
+      gap: 10,
       marginBottom: 20,
       opacity: encerrado ? .55 : 1
     }
-  }, fups.map((f, i) => {
-    const st = followStatus(f.data);
-    const canal = f.canal === "Outro" ? f.canalOutro || "Outro" : f.canal;
+  }, diasVisiveis.map(g => {
+    const abertosDoDia = g.itens.filter(x => !x.feito).length;
     return /*#__PURE__*/React.createElement("div", {
-      key: i,
+      key: `${g.dia}-${g.data}`,
       style: {
-        display: "flex",
-        alignItems: "flex-start",
-        gap: 12,
-        padding: "11px 12px",
-        borderRadius: 10,
-        background: f.feito ? "#F5F6F4" : "#fff",
-        border: `1px solid ${C.lineSoft}`
-      }
-    }, /*#__PURE__*/React.createElement("button", {
-      disabled: encerrado || !podeEditar,
-      onClick: () => f.feito ? desfazerRegistro(i) : setRegistro({
-        indice: i,
-        fup: f
-      }),
-      "aria-label": f.feito ? "Desfazer registro" : "Registrar contato",
-      style: {
-        width: 22,
-        height: 22,
-        borderRadius: 6,
-        flexShrink: 0,
-        marginTop: 1,
-        border: `1.5px solid ${f.feito ? f.semResposta ? C.brass : C.ok : C.line}`,
-        background: f.feito ? f.semResposta ? C.brass : C.ok : "#fff",
-        display: "grid",
-        placeItems: "center",
-        cursor: encerrado || !podeEditar ? "not-allowed" : "pointer"
-      }
-    }, f.feito && /*#__PURE__*/React.createElement(Icon.check, {
-      size: 13,
-      color: "#fff"
-    })), /*#__PURE__*/React.createElement("div", {
-      style: {
-        flex: 1,
-        minWidth: 0
+        border: `1px solid ${C.lineSoft}`,
+        borderRadius: 12,
+        overflow: "hidden"
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         alignItems: "center",
-        gap: 8,
-        flexWrap: "wrap"
+        gap: 10,
+        flexWrap: "wrap",
+        padding: "9px 12px",
+        background: "#F5F6F4"
       }
     }, /*#__PURE__*/React.createElement("span", {
+      className: "fr",
       style: {
-        fontSize: 13.5,
-        fontWeight: 600,
-        color: f.feito ? C.inkSoft : C.ink
+        fontSize: 14,
+        fontWeight: 700
       }
-    }, "D", f.dia, " — ", fmtBR(f.data)), f.feito && canal && /*#__PURE__*/React.createElement(Tag, {
-      cor: CANAL_COR[f.canal] || C.muted
-    }, canal), f.feito && f.semResposta && /*#__PURE__*/React.createElement(Tag, {
-      cor: C.brass
-    }, "sem resposta"), !f.feito && !encerrado && /*#__PURE__*/React.createElement(Tag, {
-      cor: statusCor(st)
-    }, URG_LABEL(f.data, false))), f.feito && /*#__PURE__*/React.createElement(React.Fragment, null, f.nota ? /*#__PURE__*/React.createElement("div", {
+    }, "D", g.dia), /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 12.5,
-        color: C.inkSoft,
-        marginTop: 5,
-        lineHeight: 1.55,
-        whiteSpace: "pre-wrap"
+        color: C.inkSoft
       }
-    }, f.nota) : /*#__PURE__*/React.createElement("div", {
+    }, fmtBR(g.data)), !ehDiaUtil(g.data) && /*#__PURE__*/React.createElement(Tag, {
+      cor: C.brass
+    }, nomeDoFeriado(g.data) || "fim de semana"), /*#__PURE__*/React.createElement("span", {
       style: {
-        fontSize: 12,
-        color: C.muted,
-        marginTop: 5,
-        fontStyle: "italic"
-      }
-    }, "Sem anotação do que foi conversado."), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        marginTop: 6
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontSize: 11,
+        marginLeft: "auto",
+        fontSize: 11.5,
         color: C.muted
       }
-    }, "registrado em ", fmtBRhora(f.feitoEm)), !encerrado && podeEditar && /*#__PURE__*/React.createElement("button", {
-      onClick: () => setRegistro({
-        indice: i,
-        fup: f
-      }),
+    }, abertosDoDia === 0 ? "dia concluído" : `${abertosDoDia} em aberto`)), /*#__PURE__*/React.createElement("div", {
       style: {
-        background: "none",
-        border: "none",
-        padding: 0,
-        fontSize: 11,
-        color: C.brass,
-        fontWeight: 600
+        display: "grid"
       }
-    }, "editar"))), !f.feito && !encerrado && podeEditar && /*#__PURE__*/React.createElement("button", {
-      onClick: () => setRegistro({
-        indice: i,
-        fup: f
-      }),
-      style: {
-        background: "none",
-        border: "none",
-        padding: 0,
-        fontSize: 11.5,
-        color: C.brass,
-        fontWeight: 600,
-        marginTop: 5
-      }
-    }, "Registrar contato")));
-  })), Array.isArray(c.historicoCiclos) && c.historicoCiclos.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    }, g.itens.map(f => {
+      const est = slotStatus(f);
+      const canal = f.canal === "Outro" ? f.canalOutro || "Outro" : f.canal;
+      const i = f.indice;
+      return /*#__PURE__*/React.createElement("div", {
+        key: i,
+        style: {
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 12,
+          padding: "11px 12px",
+          borderTop: `1px solid ${C.lineSoft}`,
+          background: f.feito ? "#FAFAF8" : "#fff"
+        }
+      }, /*#__PURE__*/React.createElement("button", {
+        disabled: encerrado || !podeEditar,
+        onClick: () => f.feito ? desfazerRegistro(i) : setRegistro({
+          indice: i,
+          fup: f
+        }),
+        "aria-label": f.feito ? "Desfazer registro" : "Registrar contato",
+        style: {
+          width: 22,
+          height: 22,
+          borderRadius: 6,
+          flexShrink: 0,
+          marginTop: 1,
+          border: `1.5px solid ${f.feito ? f.semResposta ? C.brass : C.ok : C.line}`,
+          background: f.feito ? f.semResposta ? C.brass : C.ok : "#fff",
+          display: "grid",
+          placeItems: "center",
+          cursor: encerrado || !podeEditar ? "not-allowed" : "pointer"
+        }
+      }, f.feito && /*#__PURE__*/React.createElement(Icon.check, {
+        size: 13,
+        color: "#fff"
+      })), /*#__PURE__*/React.createElement("div", {
+        style: {
+          flex: 1,
+          minWidth: 0
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexWrap: "wrap"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 13.5,
+          fontWeight: 600,
+          fontVariantNumeric: "tabular-nums",
+          color: f.feito ? C.inkSoft : C.ink
+        }
+      }, slotHora(f)), /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 11.5,
+          color: C.muted
+        }
+      }, SLOT_NOME[slotDe(f)] || ""), f.feito && canal && /*#__PURE__*/React.createElement(Tag, {
+        cor: CANAL_COR[f.canal] || C.muted
+      }, canal), f.feito && f.semResposta && /*#__PURE__*/React.createElement(Tag, {
+        cor: C.brass
+      }, "sem resposta"), !f.feito && !encerrado && /*#__PURE__*/React.createElement(Tag, {
+        cor: SLOT_COR[est],
+        forte: est === "atrasado" || est === "agora"
+      }, SLOT_ROTULO[est])), f.feito && /*#__PURE__*/React.createElement(React.Fragment, null, f.nota ? /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12.5,
+          color: C.inkSoft,
+          marginTop: 5,
+          lineHeight: 1.55,
+          whiteSpace: "pre-wrap"
+        }
+      }, f.nota) : /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          color: C.muted,
+          marginTop: 5,
+          fontStyle: "italic"
+        }
+      }, "Sem anotação do que foi conversado."), /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          marginTop: 6
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 11,
+          color: C.muted
+        }
+      }, "registrado em ", fmtBRhora(f.feitoEm)), !encerrado && podeEditar && /*#__PURE__*/React.createElement("button", {
+        onClick: () => setRegistro({
+          indice: i,
+          fup: f
+        }),
+        style: {
+          background: "none",
+          border: "none",
+          padding: 0,
+          fontSize: 11,
+          color: C.brass,
+          fontWeight: 600
+        }
+      }, "editar"))), !f.feito && !encerrado && podeEditar && /*#__PURE__*/React.createElement("button", {
+        onClick: () => setRegistro({
+          indice: i,
+          fup: f
+        }),
+        style: {
+          background: "none",
+          border: "none",
+          padding: 0,
+          fontSize: 11.5,
+          color: C.brass,
+          fontWeight: 600,
+          marginTop: 5
+        }
+      }, "Relatar o que conversou/enviou")));
+    })));
+  })), diasTodos.length > diasVisiveis.length && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      marginTop: -10,
+      marginBottom: 20
+    }
+  }, diasTodos.length - diasVisiveis.length, " ", diasTodos.length - diasVisiveis.length === 1 ? "dia concluído está escondido" : "dias concluídos estão escondidos", ". Use “Todos os dias” para revisar o que já foi relatado."), Array.isArray(c.contatosAnteriores) && c.contatosAnteriores.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 16,
+      fontWeight: 700,
+      marginBottom: 4
+    }
+  }, "Contatos anteriores"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginBottom: 10
+    }
+  }, "Registros feitos na cadência antiga, mantidos como histórico."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 8,
+      marginBottom: 20
+    }
+  }, c.contatosAnteriores.map((f, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      padding: "10px 12px",
+      borderRadius: 10,
+      background: "#F5F6F4",
+      border: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, "D", f.dia, " — ", fmtBR(f.data)), f.canal && /*#__PURE__*/React.createElement(Tag, {
+    cor: CANAL_COR[f.canal] || C.muted
+  }, f.canal === "Outro" ? f.canalOutro || "Outro" : f.canal), f.semResposta && /*#__PURE__*/React.createElement(Tag, {
+    cor: C.brass
+  }, "sem resposta")), f.nota && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.inkSoft,
+      marginTop: 5,
+      lineHeight: 1.55,
+      whiteSpace: "pre-wrap"
+    }
+  }, f.nota))))), Array.isArray(c.historicoCiclos) && c.historicoCiclos.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "fr",
     style: {
       fontSize: 16,
@@ -3190,8 +4376,8 @@ function RegistroContatoModal({
     });
   };
   return /*#__PURE__*/React.createElement(Modal, {
-    titulo: jaRegistrado ? `Editar o contato D${fup.dia}` : `Registrar o contato D${fup.dia}`,
-    sub: `${cliente.nome} · previsto para ${fmtBR(fup.data)}`,
+    titulo: `${jaRegistrado ? "Editar" : "Relatar"} o contato D${fup.dia} · ${slotHora(fup)}`,
+    sub: `${cliente.nome} · ${SLOT_NOME[slotDe(fup)] || ""} de ${fmtBR(fup.data)}`,
     largura: 640,
     onFechar: onFechar,
     rodape: /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Btn, {
@@ -3273,7 +4459,7 @@ function RegistroContatoModal({
       fontSize: 12,
       color: C.muted
     }
-  }, "Tentativa sem resposta. O contato conta como feito e a cadência segue para o próximo dia."))), /*#__PURE__*/React.createElement(Campo, {
+  }, "Tentativa sem resposta. O toque conta como feito e a cadência segue para o próximo horário."))), /*#__PURE__*/React.createElement(Campo, {
     label: semResposta ? "Observação" : "O que foi conversado",
     obrig: !semResposta,
     hint: semResposta ? "Opcional. Ex.: caixa postal, telefone fora de área." : "O que a pessoa disse, o que ficou combinado, qual o próximo passo."
@@ -3641,7 +4827,7 @@ function ReabrirModal({
     }
   }, "O ciclo atual (", cliente.ciclo || 1, "º, encerrado como", " ", /*#__PURE__*/React.createElement("strong", null, cliente.desfecho === "ganho" ? "ganho" : "perdido"), " por", " ", /*#__PURE__*/React.createElement("strong", null, rotulo(cliente.motivo, cliente.motivoOutro).toLowerCase()), ") vai para o histórico e continua contando nos relatórios. O cliente volta ao funil em um novo ciclo, com a cadência recomeçando em D1."), /*#__PURE__*/React.createElement(Campo, {
     label: "Início da nova cadência",
-    hint: "D1, D3, D5, D7, D15 e D28 a partir desta data."
+    hint: `${CADENCIA_RESUMO}, a partir desta data.`
   }, /*#__PURE__*/React.createElement(Inp, {
     type: "date",
     value: inicio,
@@ -3667,6 +4853,16 @@ function ReabrirModal({
 /* ================================================================= *
  *  FOLLOW-UP — a fila de contatos do dia
  * ================================================================= */
+/* Relógio de minuto. Sem ele a fila não perceberia a virada das 13h
+   e das 17h com a tela já aberta.                                   */
+function useRelogio(ms = 30000) {
+  const [t, setT] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setT(Date.now()), ms);
+    return () => clearInterval(id);
+  }, [ms]);
+  return t;
+}
 function listarPendencias(clientes) {
   const fila = [];
   clientes.filter(c => !c.desfecho).forEach(c => {
@@ -3675,126 +4871,123 @@ function listarPendencias(clientes) {
         cliente: c,
         fup: f,
         indice: i,
-        dias: diffDays(f.data)
+        dias: diffDays(f.data),
+        estado: slotStatus(f)
       });
     });
   });
-  return fila.sort((a, b) => a.fup.data < b.fup.data ? -1 : a.fup.data > b.fup.data ? 1 : 0);
+  return fila.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
 }
 
-/* Só o contato mais próximo de cada cliente entra na fila: cobrar D1 e D3 da
-   mesma pessoa no mesmo dia é ligar duas vezes para dizer a mesma coisa. */
-function filaDoDia(clientes) {
-  const porCliente = {};
-  listarPendencias(clientes).forEach(p => {
-    if (!porCliente[p.cliente.id]) porCliente[p.cliente.id] = p;
-  });
-  const fila = Object.values(porCliente);
+/* Agora cada cliente aparece até três vezes no mesmo dia — é essa a
+   intenção da cadência nova. O dia de hoje é quebrado em três blocos,
+   um por horário, porque é assim que a secretária trabalha: senta às
+   8h e faz a lista das 8h. Misturar os três num "cobrar agora" só
+   embaralha o que já tinha ordem.                                    */
+function filaDoDia(clientes, slotFiltro) {
+  let fila = listarPendencias(clientes);
+  if (slotFiltro && slotFiltro !== "todos") fila = fila.filter(p => slotDe(p.fup) === slotFiltro);
+  const hoje = todayISO();
+  const doDia = fila.filter(p => p.fup.data === hoje);
   return {
-    atrasados: fila.filter(p => p.dias < 0),
-    hoje: fila.filter(p => p.dias === 0),
-    semana: fila.filter(p => p.dias > 0 && p.dias <= 7),
-    depois: fila.filter(p => p.dias > 7)
+    atrasados: fila.filter(p => p.estado === "atrasado"),
+    blocos: SLOTS.map(sl => {
+      const itens = doDia.filter(p => slotDe(p.fup) === sl);
+      return {
+        slot: sl,
+        itens,
+        vencido: itens.some(p => p.estado === "agora")
+      };
+    }).filter(b => !slotFiltro || slotFiltro === "todos" || b.slot === slotFiltro),
+    hojeTotal: doDia.length,
+    vencidosHoje: doDia.filter(p => p.estado === "agora").length,
+    semana: fila.filter(p => p.estado === "futuro" && p.dias <= 7),
+    depois: fila.filter(p => p.estado === "futuro" && p.dias > 7)
   };
 }
-function Followup({
-  ctx
-}) {
-  const {
-    clientes,
-    P
-  } = ctx;
-  const [registro, setRegistro] = useState(null);
-  const [detalhe, setDetalhe] = useState(null);
-  const [editando, setEditando] = useState(null);
-  const podeEditar = P.clientes === "tudo" || P.clientes === "editar";
-  const fila = useMemo(() => filaDoDia(clientes.itens), [clientes.itens]);
-  const pendente = fila.atrasados.length + fila.hoje.length;
-  const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
-  const corrigirDiasNaoUteis = () => {
-    clientes.itens.filter(c => !c.desfecho).forEach(c => {
-      const {
-        lista,
-        mudou
-      } = ajustarParaDiasUteis(c.followups);
-      if (mudou) clientes.atualizar(c.id, {
-        followups: lista
+
+/* Quantos clientes ainda estão na cadência antiga de seis contatos. */
+const contarCadenciaAntiga = clientes => clientes.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).length;
+const CHAVE_AVISO = "zelo.ultimoAviso";
+const CHAVE_AVISO_LIGADO = "zelo.avisosLigados";
+
+/* Aviso do navegador nos horários dos toques.
+   Importante: só dispara com o Zelo aberto em alguma aba. Aviso com o
+   sistema fechado exigiria servidor (Cloud Functions + push), que não
+   existe nesta versão publicada em GitHub Pages.                     */
+function useAvisosDeSlot(fila, ligado) {
+  const marcado = useRef(null);
+  useEffect(() => {
+    if (!ligado || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const hoje = todayISO(),
+      hm = agoraHM();
+    const slotAtual = [...SLOTS].reverse().find(sl => hm >= sl);
+    if (!slotAtual) return;
+    const chave = `${hoje}#${slotAtual}`;
+    if (marcado.current === chave || lerGuardado(CHAVE_AVISO) === chave) {
+      marcado.current = chave;
+      return;
+    }
+    marcado.current = chave;
+    guardar(CHAVE_AVISO, chave);
+    const n = fila.filter(p => p.fup.data === hoje && slotDe(p.fup) === slotAtual).length;
+    if (n === 0) return;
+    try {
+      new Notification(`Zelo · toque das ${slotAtual.replace(":", "h")}`, {
+        body: `${n} ${n === 1 ? "contato para fazer" : "contatos para fazer"} agora.`,
+        tag: "zelo-followup"
       });
-    });
-  };
-  const salvar = (cliente, i, dados) => {
-    const novos = (Array.isArray(cliente.followups) ? cliente.followups : []).map((f, k) => k === i ? {
-      ...f,
-      ...dados
-    } : f);
-    clientes.atualizar(cliente.id, {
-      followups: novos
-    });
-  };
-  const Grupo = ({
-    titulo,
-    itens,
-    cor,
-    vazio
-  }) => /*#__PURE__*/React.createElement("div", {
+    } catch (e) {}
+  }, [fila, ligado]);
+}
+
+/* Linha e bloco ficam fora do Followup de propósito: componente
+   declarado dentro de outro é recriado a cada render, e o React trata
+   isso como um componente novo — a paginação voltaria para a página 1
+   a cada letra digitada na busca.                                    */
+function LinhaFila({
+  p,
+  cor,
+  podeEditar,
+  onAbrir,
+  onRegistrar
+}) {
+  return /*#__PURE__*/React.createElement(Card, {
     style: {
-      marginBottom: 26
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 9,
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      width: 9,
-      height: 9,
-      borderRadius: "50%",
-      background: cor
-    }
-  }), /*#__PURE__*/React.createElement("span", {
-    className: "fr",
-    style: {
-      fontSize: 17,
-      fontWeight: 700
-    }
-  }, titulo), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 13,
-      color: C.muted
-    }
-  }, itens.length)), itens.length === 0 ? /*#__PURE__*/React.createElement("p", {
-    style: {
-      fontSize: 13,
-      color: C.muted,
-      paddingLeft: 18
-    }
-  }, vazio) : /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gap: 9
-    }
-  }, itens.map(p => /*#__PURE__*/React.createElement(Card, {
-    key: p.cliente.id + "-" + p.indice,
-    style: {
-      padding: "13px 15px",
+      padding: "12px 15px",
       display: "flex",
       alignItems: "center",
       gap: 14,
       flexWrap: "wrap",
       borderLeft: `3px solid ${cor}`
     }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setDetalhe(p.cliente.id),
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 52,
+      flexShrink: 0,
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      lineHeight: 1.1
+    }
+  }, slotHora(p.fup)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, "D", p.fup.dia)), /*#__PURE__*/React.createElement("button", {
+    onClick: onAbrir,
     style: {
       background: "none",
       border: "none",
       padding: 0,
       textAlign: "left",
       flex: 1,
-      minWidth: 190
+      minWidth: 170
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3810,15 +5003,197 @@ function Followup({
   }, p.cliente.telefone || p.cliente.email || "sem contato cadastrado", p.cliente.area ? ` · ${p.cliente.area}` : "", ` · ${p.cliente.estagio || "Novo lead"}`)), /*#__PURE__*/React.createElement(Tag, {
     cor: cor,
     forte: p.dias <= 0
-  }, "D", p.fup.dia, " · ", p.dias < 0 ? `${Math.abs(p.dias)}d atrás` : p.dias === 0 ? "hoje" : fmtBR(p.fup.data)), podeEditar && /*#__PURE__*/React.createElement(Btn, {
-    kind: p.dias <= 0 ? "brass" : "ghost",
+  }, p.dias < 0 ? `${Math.abs(p.dias)}d atrás` : p.dias === 0 ? "hoje" : fmtBR(p.fup.data)), podeEditar && /*#__PURE__*/React.createElement(Btn, {
+    kind: p.estado === "atrasado" || p.estado === "agora" ? "brass" : "ghost",
     size: "sm",
-    onClick: () => setRegistro({
-      cliente: p.cliente,
-      indice: p.indice,
-      fup: p.fup
-    })
-  }, "Registrar contato")))));
+    onClick: onRegistrar
+  }, "Relatar contato"));
+}
+
+/* Bloco da fila com paginação própria. Cada bloco conta a sua página:
+   avançar nos atrasados não pode mexer na lista das 13h.            */
+function BlocoFila({
+  titulo,
+  sub,
+  itens,
+  cor,
+  vazio,
+  chave,
+  aberto,
+  podeEditar,
+  onAbrir,
+  onRegistrar,
+  etiqueta,
+  recolhivel = true
+}) {
+  const [expandido, setExpandido] = useState(aberto !== false);
+  const pg = usePaginacao(itens, chave);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 22
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 9,
+      marginBottom: 4,
+      flexWrap: "wrap",
+      cursor: recolhivel ? "pointer" : "default"
+    },
+    onClick: () => recolhivel && setExpandido(v => !v)
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 9,
+      height: 9,
+      borderRadius: "50%",
+      background: cor,
+      flexShrink: 0
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, titulo), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, itens.length), etiqueta, recolhivel && itens.length > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: "auto",
+      fontSize: 11.5,
+      color: C.brass,
+      fontWeight: 600
+    }
+  }, expandido ? "recolher" : "abrir")), sub && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 10,
+      paddingLeft: 18
+    }
+  }, sub), itens.length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted,
+      paddingLeft: 18
+    }
+  }, vazio) : !expandido ? null : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 9
+    }
+  }, pg.fatia.map(p => /*#__PURE__*/React.createElement(LinhaFila, {
+    key: p.cliente.id + "-" + p.indice,
+    p: p,
+    cor: cor,
+    podeEditar: podeEditar,
+    onAbrir: () => onAbrir(p),
+    onRegistrar: () => onRegistrar(p)
+  }))), /*#__PURE__*/React.createElement(Paginacao, {
+    p: pg,
+    rotulo: "contatos"
+  })));
+}
+function Followup({
+  ctx
+}) {
+  const {
+    clientes,
+    P,
+    perfil
+  } = ctx;
+  const [registro, setRegistro] = useState(null);
+  const [detalhe, setDetalhe] = useState(null);
+  const [editando, setEditando] = useState(null);
+  const [busca, setBusca] = useState("");
+  const [slotFiltro, setSlotFiltro] = useState("todos");
+  const [migrando, setMigrando] = useState(false);
+  const podeEditar = P.clientes === "tudo" || P.clientes === "editar";
+  useRelogio(); /* faz a tela virar sozinha às 8h, 13h e 17h */
+  const agora = agoraHM();
+  const itens = useMemo(() => {
+    const b = busca.trim().toLowerCase();
+    if (!b) return clientes.itens;
+    return clientes.itens.filter(c => [c.nome, c.telefone, c.email, c.area].join(" ").toLowerCase().includes(b));
+  }, [clientes.itens, busca]);
+  const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
+  const pendente = fila.atrasados.length + fila.vencidosHoje;
+  const chavePg = busca + "|" + slotFiltro;
+  const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
+  const antigos = useMemo(() => contarCadenciaAntiga(clientes.itens), [clientes.itens]);
+
+  /* avisos do navegador */
+  const [avisos, setAvisos] = useState(() => lerGuardado(CHAVE_AVISO_LIGADO) === "1");
+  const podeAvisar = typeof Notification !== "undefined";
+  /* O aviso conta os toques do horário que acabou de chegar, sempre
+     sobre a base inteira: filtrar a tela por horário ou digitar na
+     busca não pode silenciar o aviso das 13h. */
+  const filaAvisos = useMemo(() => listarPendencias(clientes.itens), [clientes.itens, agora]);
+  useAvisosDeSlot(filaAvisos, avisos);
+  const alternarAvisos = async () => {
+    if (avisos) {
+      setAvisos(false);
+      guardar(CHAVE_AVISO_LIGADO, "0");
+      return;
+    }
+    if (!podeAvisar) return;
+    let perm = Notification.permission;
+    if (perm === "default") {
+      try {
+        perm = await Notification.requestPermission();
+      } catch (e) {}
+    }
+    if (perm === "granted") {
+      setAvisos(true);
+      guardar(CHAVE_AVISO_LIGADO, "1");
+    }
+  };
+  const corrigirDiasNaoUteis = () => {
+    clientes.itens.filter(c => !c.desfecho).forEach(c => {
+      const {
+        lista,
+        mudou
+      } = ajustarParaDiasUteis(c.followups);
+      if (mudou) clientes.atualizar(c.id, {
+        followups: lista
+      });
+    });
+  };
+
+  /* Atualiza todo mundo que ficou na cadência antiga. Nada é apagado:
+     o que já foi registrado vira histórico em "contatosAnteriores". */
+  const migrarTodos = () => {
+    clientes.itens.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).forEach(c => {
+      const feitos = (c.followups || []).filter(f => f.feito).map(f => ({
+        dia: f.dia,
+        data: f.data,
+        canal: f.canal || "",
+        canalOutro: f.canalOutro || "",
+        semResposta: !!f.semResposta,
+        nota: f.nota || "",
+        feitoEm: f.feitoEm || null
+      }));
+      clientes.atualizar(c.id, {
+        followups: gerarFollowups(todayISO()),
+        inicioCiclo: todayISO(),
+        contatosAnteriores: [...(c.contatosAnteriores || []), ...feitos]
+      });
+    });
+    setMigrando(false);
+  };
+  const salvar = (cliente, i, dados) => {
+    const novos = (Array.isArray(cliente.followups) ? cliente.followups : []).map((f, k) => k === i ? {
+      ...f,
+      ...dados
+    } : f);
+    clientes.atualizar(cliente.id, {
+      followups: novos
+    });
+  };
   return /*#__PURE__*/React.createElement("div", {
     className: "rise"
   }, /*#__PURE__*/React.createElement("div", {
@@ -3836,15 +5211,116 @@ function Followup({
       fontWeight: 700,
       marginRight: "auto"
     }
-  }, "Follow-up")), /*#__PURE__*/React.createElement("p", {
+  }, "Follow-up"), podeAvisar && /*#__PURE__*/React.createElement(Btn, {
+    kind: avisos ? "ok" : "ghost",
+    size: "sm",
+    onClick: alternarAvisos,
+    icon: /*#__PURE__*/React.createElement(Icon.bell, {
+      size: 15
+    })
+  }, avisos ? "Avisos ligados" : "Ligar avisos")), /*#__PURE__*/React.createElement("p", {
     style: {
       fontSize: 13,
       color: C.muted,
-      marginBottom: 22,
-      maxWidth: 620,
+      marginBottom: 6,
+      maxWidth: 660,
       lineHeight: 1.6
     }
-  }, pendente === 0 ? "Nenhum contato pendente para hoje. A cadência está em dia." : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} hoje, contando os atrasados.`, " ", "Cada cliente aparece uma vez só, no contato mais antigo em aberto."), emDiaNaoUtil > 0 && podeEditar && /*#__PURE__*/React.createElement(Card, {
+  }, pendente === 0 ? `Nenhum contato vencido às ${agora.replace(":", "h")}. A cadência está em dia.` : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} agora, contando os atrasados.`, " ", "Cada cliente tem três toques por dia — ", SLOTS.map(h => h.replace(":", "h")).join(", "), " — e cada um pede o relato do que foi conversado ou enviado."), avisos && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginBottom: 18,
+      maxWidth: 660,
+      lineHeight: 1.55
+    }
+  }, "Os avisos do navegador só aparecem com o Zelo aberto em alguma aba. Com o sistema fechado, o computador não tem como ser avisado."), !avisos && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 18
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      flexWrap: "wrap",
+      marginBottom: 18,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement(Inp, {
+    value: busca,
+    onChange: e => setBusca(e.target.value),
+    placeholder: "Filtrar por nome, telefone, e-mail…",
+    style: {
+      maxWidth: 320
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, [["todos", "Todos os horários"], ...SLOTS.map(sl => [sl, sl.replace(":", "h")])].map(([v, r]) => {
+    const at = slotFiltro === v;
+    return /*#__PURE__*/React.createElement("button", {
+      key: v,
+      onClick: () => setSlotFiltro(v),
+      style: {
+        padding: "8px 13px",
+        borderRadius: 9,
+        fontSize: 12.5,
+        fontWeight: 600,
+        border: `1px solid ${at ? C.brass : C.line}`,
+        background: at ? C.brass : "#fff",
+        color: at ? "#fff" : C.inkSoft,
+        cursor: "pointer"
+      }
+    }, r);
+  }))), antigos > 0 && podeEditar && /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: "14px 16px",
+      marginBottom: 16,
+      background: "#9C7C3C0F",
+      borderColor: "#9C7C3C33"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13.5,
+      fontWeight: 600,
+      marginBottom: 3
+    }
+  }, antigos, " ", antigos === 1 ? "cliente está" : "clientes estão", " na cadência antiga"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      lineHeight: 1.55,
+      marginBottom: 10
+    }
+  }, "Foram cadastrados quando a régua era D1, D3, D5, D7, D15 e D28, com um contato por dia. Atualizar cria a grade nova (", CADENCIA_RESUMO, ") começando hoje. Os contatos já registrados viram histórico dentro de cada cliente — nada é apagado."), migrando ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12.5,
+      fontWeight: 600,
+      marginRight: "auto"
+    }
+  }, "Confirma atualizar ", antigos, " ", antigos === 1 ? "cliente" : "clientes", "?"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: () => setMigrando(false)
+  }, "Cancelar"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: migrarTodos
+  }, "Sim, atualizar todos")) : /*#__PURE__*/React.createElement(Btn, {
+    kind: "brass",
+    size: "sm",
+    onClick: () => setMigrando(true)
+  }, "Atualizar todos")), emDiaNaoUtil > 0 && podeEditar && /*#__PURE__*/React.createElement(Card, {
     style: {
       padding: "14px 16px",
       marginBottom: 20,
@@ -3872,7 +5348,7 @@ function Followup({
       color: C.muted,
       lineHeight: 1.55
     }
-  }, "São cadências criadas antes de o sistema respeitar sábado, domingo e feriado nacional. O ajuste move cada um para o próximo dia útil, sem mexer no que já foi feito.")), /*#__PURE__*/React.createElement(Btn, {
+  }, "O ajuste move o dia inteiro para o próximo dia útil, com os três toques juntos, sem mexer no que já foi registrado.")), /*#__PURE__*/React.createElement(Btn, {
     kind: "brass",
     size: "sm",
     onClick: corrigirDiasNaoUteis
@@ -3881,20 +5357,75 @@ function Followup({
       fontSize: 13,
       color: C.muted
     }
-  }, "Carregando…") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Grupo, {
+  }, "Carregando…") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(BlocoFila, {
     titulo: "Atrasados",
     itens: fila.atrasados,
     cor: C.late,
+    chave: chavePg + "|atrasados",
+    podeEditar: podeEditar,
+    onAbrir: p => setDetalhe(p.cliente.id),
+    onRegistrar: p => setRegistro({
+      cliente: p.cliente,
+      indice: p.indice,
+      fup: p.fup
+    }),
+    sub: "Toques de dias anteriores que ficaram sem registro. A hora à esquerda é a do toque original.",
     vazio: "Nada atrasado. Bom sinal."
-  }), /*#__PURE__*/React.createElement(Grupo, {
-    titulo: "Para hoje",
-    itens: fila.hoje,
-    cor: C.brass,
-    vazio: "Nenhum contato marcado para hoje."
-  }), /*#__PURE__*/React.createElement(Grupo, {
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      margin: "26px 0 4px"
+    }
+  }, "Hoje, por horário"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 14,
+      lineHeight: 1.55
+    }
+  }, fila.hojeTotal === 0 ? "Nenhum toque programado para hoje." : `${fila.hojeTotal} ${fila.hojeTotal === 1 ? "toque" : "toques"} hoje · agora são ${agora.replace(":", "h")}.`), fila.blocos.map(b => {
+    const passou = agora >= b.slot;
+    return /*#__PURE__*/React.createElement(BlocoFila, {
+      key: b.slot,
+      titulo: `${b.slot.replace(":", "h")} · ${SLOT_NOME[b.slot] || ""}`,
+      itens: b.itens,
+      cor: b.vencido ? C.brass : passou ? C.ok : "#3E6C99",
+      chave: chavePg + "|" + b.slot,
+      aberto: b.itens.length > 0 && (b.vencido || !passou),
+      podeEditar: podeEditar,
+      onAbrir: p => setDetalhe(p.cliente.id),
+      onRegistrar: p => setRegistro({
+        cliente: p.cliente,
+        indice: p.indice,
+        fup: p.fup
+      }),
+      etiqueta: b.itens.length === 0 ? null : b.vencido ? /*#__PURE__*/React.createElement(Tag, {
+        cor: C.brass,
+        forte: true
+      }, "cobrar agora") : passou ? /*#__PURE__*/React.createElement(Tag, {
+        cor: C.ok
+      }, "horário concluído") : /*#__PURE__*/React.createElement(Tag, {
+        cor: "#3E6C99"
+      }, "a partir das ", b.slot.replace(":", "h")),
+      sub: null,
+      vazio: passou ? "Todos os toques deste horário já foram relatados." : "Nenhum toque neste horário hoje."
+    });
+  }), /*#__PURE__*/React.createElement(BlocoFila, {
     titulo: "Próximos 7 dias",
     itens: fila.semana,
     cor: C.ok,
+    chave: chavePg + "|semana",
+    aberto: false,
+    podeEditar: podeEditar,
+    onAbrir: p => setDetalhe(p.cliente.id),
+    onRegistrar: p => setRegistro({
+      cliente: p.cliente,
+      indice: p.indice,
+      fup: p.fup
+    }),
+    sub: "Fica recolhido para não competir com o trabalho de hoje.",
     vazio: "Semana sem contatos programados."
   }), fila.depois.length > 0 && /*#__PURE__*/React.createElement("p", {
     style: {
@@ -5723,11 +7254,6 @@ function EditarUsuario({
 }
 
 /* --------------------------- montagem ---------------------------- */
-ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
-
-/* ================================================================= *
- *  DADOS DE EXEMPLO
- * ================================================================= */
 function seedDemo() {
   const d = n => {
     const x = new Date();
@@ -5739,14 +7265,17 @@ function seedDemo() {
     x.setDate(x.getDate() + n);
     return x.toISOString();
   };
-  /* registros de conversa: cada item é [canal, semResposta, anotação] na ordem dos contatos */
+  /* Cada registro é [canal, semResposta, anotação] e cai no toque
+     seguinte da régua: D1 08h, D1 13h, D1 17h, D2 08h, e assim por
+     diante. O horário do registro sai do próprio toque, para a ficha
+     não mostrar contato das 8h anotado às 15h. */
   const conversa = (inicio, registros) => gerarFollowups(inicio).map((f, i) => {
     const r = registros[i];
     if (!r) return f;
     const [canal, semResposta, nota] = r;
-    const quando = new Date();
-    quando.setDate(quando.getDate() - (CADENCIA.length - i) * 2);
-    quando.setHours(9 + i % 8, i * 17 % 60, 0, 0);
+    const quando = parseISO(f.data);
+    const [hh, mm] = slotDe(f).split(":");
+    quando.setHours(Number(hh), Number(mm) + 4 + i % 9, 0, 0);
     return {
       ...f,
       feito: true,
@@ -5757,6 +7286,32 @@ function seedDemo() {
       nota
     };
   });
+
+  /* Para cliente em aberto a régua tem de bater com o relógio: não
+     adianta fixar "começou há 9 dias" e registrar 3 conversas, porque
+     sobrariam 21 toques atrasados. Procuro o início que deixa o
+     cliente exatamente no ponto da conversa contada. */
+  const inicioParaToques = n => {
+    for (let volta = 0; volta <= 45; volta++) {
+      const inicio = addDays(todayISO(), -volta);
+      const passados = gerarFollowups(inicio).filter(f => {
+        const e = slotStatus(f);
+        return e === "atrasado" || e === "agora";
+      }).length;
+      if (passados >= n) return inicio;
+    }
+    return addDays(todayISO(), -1);
+  };
+
+  /* Espalha no objeto do cliente as três chaves que andam juntas. */
+  const emAndamento = registros => {
+    const inicio = inicioParaToques(registros.length);
+    return {
+      criadoEm: parseISO(inicio).toISOString(),
+      inicioCiclo: inicio,
+      followups: conversa(inicio, registros)
+    };
+  };
   const clientes = [{
     id: "c1",
     nome: "Marlene Aparecida dos Santos",
@@ -5767,12 +7322,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Proposta enviada",
     valorProposta: 6500,
-    criadoEm: ts(-9),
     ciclo: 1,
-    inicioCiclo: d(-9),
     responsavel: "u1",
     observacoes: "Demitida sem justa causa após 7 anos. Verbas rescisórias não pagas. Tem holerites e conversas de WhatsApp.",
-    followups: conversa(d(-9), [["WhatsApp", false, "Retornou o contato. Confirmou que foi demitida sem justa causa depois de 7 anos e que não recebeu as verbas. Vai mandar os holerites."], ["WhatsApp", false, "Mandou 14 holerites e os prints das conversas com o RH. Material bom, dá para comprovar as horas extras."], ["Ligação", true, "Liguei duas vezes no fim da tarde, caiu na caixa postal."]]),
+    ...emAndamento([["WhatsApp", false, "Retornou o contato. Confirmou que foi demitida sem justa causa depois de 7 anos e que não recebeu as verbas. Vai mandar os holerites."], ["WhatsApp", false, "Mandou 14 holerites e os prints das conversas com o RH. Material bom, dá para comprovar as horas extras."], ["Ligação", true, "Liguei duas vezes no fim da tarde, caiu na caixa postal."]]),
     historicoCiclos: []
   }, {
     id: "c2",
@@ -5806,12 +7359,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Consulta agendada",
     valorProposta: 4200,
-    criadoEm: ts(-4),
     ciclo: 1,
-    inicioCiclo: d(-4),
     responsavel: "u3",
     observacoes: "Guarda compartilhada. Consulta marcada para esta semana.",
-    followups: conversa(d(-4), [["WhatsApp", false, "Quer guarda compartilhada da filha de 6 anos. Separação recente, relação ainda civilizada com a mãe."], ["Ligação", false, "Explicou melhor a rotina. Consulta marcada para esta semana, vai trazer a certidão de nascimento."]]),
+    ...emAndamento([["WhatsApp", false, "Quer guarda compartilhada da filha de 6 anos. Separação recente, relação ainda civilizada com a mãe."], ["Ligação", false, "Explicou melhor a rotina. Consulta marcada para esta semana, vai trazer a certidão de nascimento."]]),
     historicoCiclos: []
   }, {
     id: "c4",
@@ -5929,12 +7480,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Proposta enviada",
     valorProposta: 5400,
-    criadoEm: ts(-14),
     ciclo: 1,
-    inicioCiclo: d(-14),
     responsavel: "u3",
     observacoes: "Acidente de trânsito, danos materiais e morais. Boletim de ocorrência em mãos.",
-    followups: conversa(d(-14), [["WhatsApp", false, "Acidente na Av. dos Estados. Carro parado há 3 semanas, tem BO e orçamentos."], ["WhatsApp", false, "Mandou as fotos e o boletim de ocorrência."], ["Ligação", false, "Conversamos sobre danos materiais e morais. Vou preparar a proposta."], ["E-mail", false, "Proposta enviada. Ficou de responder até o fim da semana."]]),
+    ...emAndamento([["WhatsApp", false, "Acidente na Av. dos Estados. Carro parado há 3 semanas, tem BO e orçamentos."], ["WhatsApp", false, "Mandou as fotos e o boletim de ocorrência."], ["Ligação", false, "Conversamos sobre danos materiais e morais. Vou preparar a proposta."], ["E-mail", false, "Proposta enviada. Ficou de responder até o fim da semana."]]),
     historicoCiclos: []
   }, {
     id: "c8",
@@ -5990,12 +7539,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Novo lead",
     valorProposta: "",
-    criadoEm: ts(-3),
     ciclo: 1,
-    inicioCiclo: d(-3),
     responsavel: "u3",
     observacoes: "Horas extras não pagas. Ainda trabalha na empresa.",
-    followups: conversa(d(-3), [["WhatsApp", false, "Horas extras não pagas há 2 anos. Ainda está na empresa, tem receio de represália. Expliquei a prescrição quinquenal."]]),
+    ...emAndamento([["WhatsApp", false, "Horas extras não pagas há 2 anos. Ainda está na empresa, tem receio de represália. Expliquei a prescrição quinquenal."]]),
     historicoCiclos: []
   }, {
     id: "c11",
@@ -6007,12 +7554,10 @@ function seedDemo() {
     origemOutro: "indicação do contador",
     estagio: "Consulta agendada",
     valorProposta: 3900,
-    criadoEm: ts(-7),
     ciclo: 1,
-    inicioCiclo: d(-7),
     responsavel: "u1",
     observacoes: "Auxílio-doença negado pelo INSS. Tem laudo médico.",
-    followups: conversa(d(-7), [["Ligação", false, "Auxílio-doença negado pelo INSS. Tem laudo do ortopedista e exames."], ["WhatsApp", false, "Mandou o laudo e a carta de indeferimento."], ["Ligação", true, "Liguei para marcar a consulta, não atendeu. Vou tentar amanhã de manhã."]]),
+    ...emAndamento([["Ligação", false, "Auxílio-doença negado pelo INSS. Tem laudo do ortopedista e exames."], ["WhatsApp", false, "Mandou o laudo e a carta de indeferimento."], ["Ligação", true, "Liguei para marcar a consulta, não atendeu. Vou tentar amanhã de manhã."]]),
     historicoCiclos: []
   }, {
     id: "c12",
@@ -6046,12 +7591,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Proposta enviada",
     valorProposta: 2800,
-    criadoEm: ts(-11),
     ciclo: 1,
-    inicioCiclo: d(-11),
     responsavel: "u3",
     observacoes: "Produto com defeito, loja se recusa a trocar.",
-    followups: conversa(d(-11), [["WhatsApp", false, "Comprou uma geladeira com defeito, a loja se recusa a trocar. Tem nota fiscal e protocolos."], ["WhatsApp", false, "Mandou os protocolos de atendimento e o vídeo do defeito."], ["Ligação", false, "Expliquei que dá para pedir troca mais danos morais. Vou mandar a proposta."], ["WhatsApp", false, "Proposta enviada. Está comparando com outro escritório."]]),
+    ...emAndamento([["WhatsApp", false, "Comprou uma geladeira com defeito, a loja se recusa a trocar. Tem nota fiscal e protocolos."], ["WhatsApp", false, "Mandou os protocolos de atendimento e o vídeo do defeito."], ["Ligação", false, "Expliquei que dá para pedir troca mais danos morais. Vou mandar a proposta."], ["WhatsApp", false, "Proposta enviada. Está comparando com outro escritório."]]),
     historicoCiclos: []
   }, {
     id: "c14",
@@ -6063,12 +7606,10 @@ function seedDemo() {
     origemOutro: "",
     estagio: "Novo lead",
     valorProposta: "",
-    criadoEm: ts(-2),
     ciclo: 1,
-    inicioCiclo: d(-2),
     responsavel: "u1",
     observacoes: "Problema de vizinhança, construção irregular no muro divisório.",
-    followups: conversa(d(-2), [["Presencial", false, "Passou no escritório sem agendar. Vizinho construiu em cima do muro divisório. Vai trazer a matrícula do imóvel."]]),
+    ...emAndamento([["Presencial", false, "Passou no escritório sem agendar. Vizinho construiu em cima do muro divisório. Vai trazer a matrícula do imóvel."]]),
     historicoCiclos: []
   }, {
     id: "c15",
@@ -6093,6 +7634,33 @@ function seedDemo() {
     followups: conversa(d(-22), [["WhatsApp", false, "Veio pelo anúncio. Questão sindical de categoria, fora da nossa atuação."], ["Ligação", false, "Expliquei que não atuamos com direito coletivo sindical."], ["WhatsApp", false, "Passei o contato da Dra. Cristina, que é da área."], ["WhatsApp", true, "Sem resposta."], ["Ligação", false, "Agradeceu a indicação, já falou com a colega."]]),
     historicoCiclos: []
   }];
+
+  /* Base antiga trazida da planilha de controle: dá volume à fila,
+     que é onde a paginação e a quebra por horário se justificam. */
+  const NOMES_EXTRA = [["Vanderlei Souza Prado", "Trabalhista", "Indicação", "Novo lead"], ["Iracema Nunes Batista", "Previdenciário", "Google", "Contato feito"], ["Comércio de Tintas Aurora Ltda.", "Empresarial", "Site", "Consulta agendada"], ["Djalma Rocha Vieira", "Cível", "Indicação", "Novo lead"], ["Neusa Barbosa de Almeida", "Família", "Instagram", "Contato feito"], ["Élcio Ferrari Mendonça", "Consumidor", "Google", "Proposta enviada"], ["Transportes Pontual ME", "Trabalhista", "Parceiro/advogado", "Consulta agendada"], ["Cleusa Maria do Nascimento", "Previdenciário", "Indicação", "Novo lead"], ["Wanderson Lopes Tavares", "Criminal", "Site", "Contato feito"], ["Padaria Estrela do Sul Ltda.", "Empresarial", "Indicação", "Proposta enviada"], ["Zulmira Antunes Correia", "Família", "Google", "Novo lead"], ["Fábio Henrique Quintela", "Cível", "Instagram", "Contato feito"], ["Odete Cardoso da Fonseca", "Consumidor", "Indicação", "Novo lead"], ["Auto Peças Bandeirante Ltda.", "Empresarial", "Site", "Contato feito"], ["Reginaldo Alves Pimenta", "Trabalhista", "Google", "Consulta agendada"], ["Marilda Teixeira Bomfim", "Previdenciário", "Indicação", "Novo lead"], ["Josenildo Peixoto Ramos", "Criminal", "Parceiro/advogado", "Contato feito"], ["Escola Infantil Girassol ME", "Empresarial", "Indicação", "Proposta enviada"]];
+  const RELATOS = [["WhatsApp", false, "Explicou o caso por áudio. Vai mandar os documentos."], ["Ligação", false, "Atendeu no fim da tarde. Pediu para retornar amanhã."], ["Ligação", true, "Chamou e caiu na caixa postal."], ["WhatsApp", false, "Mandou as fotos e a nota fiscal."], ["E-mail", false, "Respondeu confirmando os dados."], ["WhatsApp", true, "Mensagem entregue, sem visualização."]];
+  NOMES_EXTRA.forEach((linha, k) => {
+    const [nome, area, origem, estagio] = linha;
+    const quantos = 1 + (k * 2 + 1) % 5;
+    clientes.push({
+      id: "x" + (k + 1),
+      nome,
+      area,
+      origem,
+      origemOutro: "",
+      estagio,
+      telefone: `(11) 9${String(4000 + k * 137).slice(0, 4)}-${String(1000 + k * 311).slice(0, 4)}`,
+      email: "",
+      valorProposta: [0, 2800, 3500, 4200, 6000][k % 5],
+      responsavel: k % 3 === 0 ? "u3" : "u1",
+      ciclo: 1,
+      observacoes: "Ficha trazida da planilha de controle do escritório.",
+      importado: true,
+      desfecho: null,
+      historicoCiclos: [],
+      ...emAndamento(RELATOS.slice(0, quantos))
+    });
+  });
   const processos = [{
     id: "p1",
     titulo: "Reclamatória trabalhista — verbas rescisórias",
@@ -6278,6 +7846,7 @@ function seedDemo() {
   };
 }
 STORE = seedDemo();
+ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
 </body>
 </html>
