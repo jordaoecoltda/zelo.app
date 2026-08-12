@@ -93,7 +93,7 @@
 <!-- O código-fonte fica em JSX legível aqui embaixo e é compilado no navegador
      pelo Babel (ver o bloco de inicialização no fim do arquivo). -->
 <script type="text/jsx" id="zelo-fonte">
-const { useState, useEffect, useMemo, useRef } = React;
+const { useState, useEffect, useLayoutEffect, useMemo, useRef } = React;
 
 /* ================================================================= *
  *  CONFIGURAÇÃO FIREBASE
@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-10-e";
+const BUILD = "2026-08-12-b";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -217,19 +217,28 @@ const fmtBRhora = iso => { if (!iso) return "—"; const dt = new Date(iso); ret
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 const brl = v => v ? `R$ ${Number(v).toLocaleString("pt-BR")}` : "—";
 
+/* Data que vale como "cadastro" nos relatorios.
+   criadoEm  = quando a ficha entrou no Zelo (carimbo de auditoria, nunca muda).
+   dataCadastro = quando o lead realmente chegou ao escritorio, vindo da planilha.
+   Sem o segundo campo, uma importacao em lote empilharia meses de historico
+   num unico dia e distorceria qualquer leitura de ritmo. */
+const dataDeCadastro = c => String((c && (c.dataCadastro || c.criadoEm)) || "").slice(0,10);
+
 /* ---- horário dos três toques diários ---- */
 const agoraHM   = () => { const d = new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const slotDe    = f => (f && f.slot) || SLOT_PADRAO;
 const slotHora  = f => slotDe(f).replace(":", "h");
 /* atrasado = passou do dia · agora = chegou a hora de hoje
    aguardando = ainda vai chegar hoje · futuro = outro dia         */
-const slotStatus = (f) => {
+/* hoje/hm são opcionais: quem chama em laço passa os dois já prontos,
+   quem chama avulso continua funcionando igual. */
+const slotStatus = (f, hoje, hm) => {
   if (!f) return "futuro";
   if (f.feito) return "feito";
-  const hoje = todayISO();
-  if (f.data < hoje) return "atrasado";
-  if (f.data > hoje) return "futuro";
-  return agoraHM() >= slotDe(f) ? "agora" : "aguardando";
+  const d = hoje || todayISO();
+  if (f.data < d) return "atrasado";
+  if (f.data > d) return "futuro";
+  return (hm || agoraHM()) >= slotDe(f) ? "agora" : "aguardando";
 };
 const SLOT_COR = { atrasado:"#B4472E", agora:"#9C7C3C", aguardando:"#3E6C99",
                    futuro:"#6F7A87", feito:"#4F7A5C" };
@@ -464,6 +473,26 @@ const Txt = p => <textarea {...p} style={{ ...inputStyle, minHeight:80, resize:"
    (as animações de entrada das abas, por exemplo) viraria o quadro de
    referência do position:fixed e recortaria o modal. */
 function Modal({ titulo, sub, onFechar, children, rodape, largura = 720 }) {
+  /* Cada modal tem o SEU proprio nó no body.
+     Antes todos usavam document.body como container do portal. Quando dois
+     modais existiam ao mesmo tempo — a ficha do cliente e o modal de excluir,
+     por exemplo — e um commit desmontava um e montava outro, o React tentava
+     remover um nó que já não estava onde ele esperava e estourava
+     "removeChild: the node to be removed is not a child of this node".
+     Esse erro derruba o commit e faz o React refazer a árvore inteira, o que
+     no volume de hoje custa caro. Container isolado acaba com a classe toda. */
+  const [alvo] = useState(() => {
+    const el = document.createElement("div");
+    el.setAttribute("data-zelo-modal", "");
+    return el;
+  });
+  /* useLayoutEffect e não useEffect: o nó precisa estar no body antes da
+     pintura, senão o modal pisca no primeiro quadro. */
+  useLayoutEffect(() => {
+    document.body.appendChild(alvo);
+    return () => { if (alvo.parentNode) alvo.parentNode.removeChild(alvo); };
+  }, [alvo]);
+
   useEffect(() => {
     const before = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -491,7 +520,7 @@ function Modal({ titulo, sub, onFechar, children, rodape, largura = 720 }) {
     </div>
   );
 
-  return ReactDOM.createPortal(conteudo, document.body);
+  return ReactDOM.createPortal(conteudo, alvo);
 }
 
 function Tag({ children, cor = C.muted, forte }) {
@@ -840,11 +869,16 @@ function Workspace({ user, perfil }) {
   /* contatos vencidos ou com a hora já batida — o relógio entra na
      conta para o número virar sozinho às 8h, 13h e 17h */
   const tique = useRelogio();
+  /* Varredura única da base. Painel e Follow-up recebem esta lista pelo ctx
+     em vez de refazer a própria — eram quatro passadas por ciclo. */
+  const pendencias = useMemo(() => listarPendencias(clientes.itens),
+                             [clientes.itens, tique]);
+
   const pendentes = useMemo(() => {
-    const f = filaDoDia(clientes.itens, "todos");
+    const f = filaDoDia(null, "todos", pendencias);
     return { atrasados: f.atrasados.length, agora: f.vencidosHoje, hoje: f.hojeTotal,
              total: f.atrasados.length + f.vencidosHoje };
-  }, [clientes.itens, tique]);
+  }, [pendencias]);
 
   /* o contador também vai para o título da aba do navegador */
   useEffect(() => {
@@ -863,7 +897,14 @@ function Workspace({ user, perfil }) {
     ...(P.usuarios ? [{ id:"usuarios", nome:"Usuários", icone:Icon.users }] : [])
   ];
 
-  const ctx = { user, perfil, P, clientes, processos, eventos, pendentes, irPara: setAba };
+  /* Relatórios precisa conseguir abrir a ficha de um cliente que está em outra
+     aba. Guardamos o id aqui e a aba Clientes consome e limpa. */
+  const [foco, setFoco] = useState(null);
+  const ctx = {
+    user, perfil, P, clientes, processos, eventos, pendentes, pendencias, irPara: setAba,
+    foco, limparFoco: () => setFoco(null),
+    irParaCliente: (id) => { setFoco(id); setAba("clientes"); }
+  };
 
   return (
     <div style={{ minHeight:"100dvh", display:"flex", flexDirection:"column", background:C.paper }}>
@@ -970,19 +1011,18 @@ function Workspace({ user, perfil }) {
 
 /* --------------------------- PAINEL ------------------------------ */
 function Painel({ ctx }) {
-  const { clientes, processos, eventos, perfil, P, irPara } = ctx;
+  const { clientes, processos, eventos, perfil, P, irPara, pendencias } = ctx;
   const hoje = todayISO();
 
-  const emAberto = clientes.itens.filter(c => !c.desfecho);
-  useRelogio();
-  const fups = [];
-  emAberto.forEach(c => {
-    (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
-      const e = slotStatus(f);
-      if (e === "atrasado" || e === "agora") fups.push({ cliente:c, fup:f });
-    });
-  });
-  fups.sort((a,b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
+  const emAberto = useMemo(() => clientes.itens.filter(c => !c.desfecho), [clientes.itens]);
+
+  /* Antes esta varredura ficava solta no corpo do componente: refazia a base
+     inteira a cada renderização, e o useRelogio local forçava uma a cada 30 s.
+     Agora reaproveita a lista já ordenada do Workspace, que também é quem
+     dispara a atualização de horário. */
+  const fups = useMemo(
+    () => (pendencias || []).filter(p => p.estado === "atrasado" || p.estado === "agora"),
+    [pendencias]);
 
   const prazos = [];
   processos.itens.forEach(pr => {
@@ -1032,7 +1072,7 @@ function Painel({ ctx }) {
           </div>
           {fups.length === 0
             ? <p style={{ fontSize:13, color:C.muted }}>Nenhum contato pendente. Cadência em dia.</p>
-            : fups.slice(0, 6).map(({ cliente, fup }) => (
+            : fups.slice(0, 6).map(({ cliente, fup, estado }) => (
                 <button key={cliente.id + chaveFup(fup)} onClick={() => irPara("followup")}
                         style={{ width:"100%", textAlign:"left", background:"transparent",
                                  border:"none", borderBottom:`1px solid ${C.lineSoft}`,
@@ -1044,8 +1084,8 @@ function Painel({ ctx }) {
                       D{fup.dia} · {slotHora(fup)} · {cliente.telefone || cliente.email || "sem contato"}
                     </div>
                   </div>
-                  <Tag cor={SLOT_COR[slotStatus(fup)]}>
-                    {slotStatus(fup) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora"}
+                  <Tag cor={SLOT_COR[estado]}>
+                    {estado === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora"}
                   </Tag>
                 </button>
               ))}
@@ -1152,6 +1192,14 @@ function Clientes({ ctx }) {
   const [detalhe, setDetalhe] = useState(null);
   const [importando, setImportando] = useState(false);
   const [filtroTema, setFiltroTema] = useState("todos");
+
+  /* Veio de outra aba pedindo um cliente específico: abre a ficha direto e
+     solta o filtro, para que ele continue visível ao fechar o modal. */
+  useEffect(() => {
+    if (!ctx.foco) return;
+    setDetalhe(ctx.foco); setFiltro("todos"); setFiltroTema("todos"); setBusca("");
+    ctx.limparFoco();
+  }, [ctx.foco]);
 
   const lista = useMemo(() => {
     let l = clientes.itens;
@@ -1585,7 +1633,15 @@ const CAMPOS_IMPORT = [
   { id:"valorProposta", rotulo:"Valor da proposta",
     apelidos:["valor","proposta","valor da proposta","honorarios","ticket","preco"] },
   { id:"observacoes", rotulo:"Observações",
-    apelidos:["observacao","observacoes","obs","anotacoes","anotacao","detalhes","descricao","historico","resumo"] }
+    apelidos:["observacao","observacoes","obs","anotacoes","anotacao","detalhes","descricao","historico","resumo"] },
+  /* Fica por último de propósito: os outros campos escolhem a coluna deles
+     primeiro, e "data"/"entrada" só valem em correspondência exata para não
+     roubar uma coluna de "data de nascimento" ou "data da audiência". */
+  { id:"dataCadastro", rotulo:"Data do cadastro",
+    apelidos:["data do cadastro","data cadastro","data de cadastro","data de entrada",
+              "data do lead","data do contato","data da entrada","dt cadastro",
+              "cadastrado em","criado em","entrada","data"],
+    soExato:["entrada","data"] }
 ];
 
 const adivinharColunas = (cabecalho) => {
@@ -1599,7 +1655,7 @@ const adivinharColunas = (cabecalho) => {
       if (i >= 0) achou = i;
     });
     if (achou < 0) campo.apelidos.forEach(ap => {
-      if (achou >= 0 || ap.length < 3) return;
+      if (achou >= 0 || ap.length < 3 || (campo.soExato || []).includes(ap)) return;
       const i = norm.findIndex((h, idx) => !usadas.has(idx) && h.includes(ap));
       if (i >= 0) achou = i;
     });
@@ -1647,15 +1703,30 @@ const valorParaReais = (bruto) => {
   return isFinite(n) && n > 0 ? Math.round(n) : "";
 };
 
-/* Data em dd/mm/aaaa, dd-mm-aaaa ou aaaa-mm-dd. */
+/* Data vinda de planilha. Além do texto em formato brasileiro, o SheetJS pode
+   devolver um objeto Date ou o número serial do Excel — virar texto antes de
+   olhar o tipo destruiria esses dois casos. Data implausível é descartada:
+   melhor a ficha cair no criadoEm do que sujar o relatório. */
 const dataParaISO = (bruto) => {
-  const t = String(bruto == null ? "" : bruto).trim();
-  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  if (bruto == null || bruto === "") return "";
+  const plausivel = iso => (iso >= "2000-01-01" && iso <= addDays(todayISO(), 1)) ? iso : "";
+  if (bruto instanceof Date && !isNaN(bruto.getTime())) return plausivel(toISO(bruto));
+  if (typeof bruto === "number" && isFinite(bruto)) {
+    if (bruto < 1 || bruto > 60000) return "";
+    const d = new Date(Math.round((bruto - 25569) * 86400000));
+    if (isNaN(d.getTime())) return "";
+    return plausivel(toISO(new Date(d.getTime() + d.getTimezoneOffset() * 60000)));
+  }
+  const t = String(bruto).trim();
+  if (!t) return "";
+  let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return plausivel(`${m[1]}-${pad(Number(m[2]))}-${pad(Number(m[3]))}`);
   m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
   if (m) {
-    const ano = m[3].length === 2 ? `20${m[3]}` : m[3];
-    return `${ano}-${pad(Number(m[2]))}-${pad(Number(m[1]))}`;
+    const dia = Number(m[1]), mes = Number(m[2]);
+    if (mes < 1 || mes > 12 || dia < 1 || dia > 31) return "";
+    const ano = m[3].length === 2 ? (Number(m[3]) > 70 ? `19${m[3]}` : `20${m[3]}`) : m[3];
+    return plausivel(`${ano}-${pad(mes)}-${pad(dia)}`);
   }
   return "";
 };
@@ -1753,11 +1824,15 @@ function ImportarClientes({ ctx, onFechar }) {
         const idx = mapa[id];
         return idx >= 0 ? String(linha[idx] == null ? "" : linha[idx]).trim() : "";
       };
+      /* Data precisa do valor cru: o SheetJS pode entregar Date ou serial,
+         e converter para texto antes destruiria os dois casos. */
+      const pegaCru = id => { const idx = mapa[id]; return idx >= 0 ? linha[idx] : null; };
       const nome = pega("nome");
       const bruto = {
         nome, telefone: pega("telefone"), email: pega("email"), cpf: pega("cpf"),
         area: pega("area"), tema: pega("tema"), origem: pega("origem"), estagio: pega("estagio"),
-        valorProposta: pega("valorProposta"), observacoes: pega("observacoes")
+        valorProposta: pega("valorProposta"), observacoes: pega("observacoes"),
+        dataCadastro: pega("dataCadastro")
       };
 
       if (!nome) return { i, bruto, status: "erro", motivo: "sem nome" };
@@ -1787,13 +1862,17 @@ function ImportarClientes({ ctx, onFechar }) {
       const notas = [bruto.observacoes];
       if (bruto.area && !area) notas.push(`Área na planilha: ${bruto.area}`);
 
+      /* Data do cadastro na planilha. Vazio aqui significa "usa o criadoEm". */
+      const dataCadastro = dataParaISO(pegaCru("dataCadastro"));
+      const dataInvalida = mapa.dataCadastro >= 0 && !!bruto.dataCadastro && !dataCadastro;
+
       const dados = {
         nome, telefone: maskTel(bruto.telefone), email: bruto.email, cpf: bruto.cpf,
-        area: area || "", tema, temaOutro, origem, origemOutro,
+        area: area || "", tema, temaOutro, origem, origemOutro, dataCadastro,
         estagio, valorProposta: valorParaReais(bruto.valorProposta),
         observacoes: notas.filter(Boolean).join("\n")
       };
-      return { i, bruto, dados, status: dup ? "duplicado" : "novo" };
+      return { i, bruto, dados, dataInvalida, status: dup ? "duplicado" : "novo" };
     });
   }, [corpo, mapa, etapa, clientes.itens]);
 
@@ -1977,7 +2056,7 @@ function ImportarClientes({ ctx, onFechar }) {
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12.5 }}>
               <thead>
                 <tr style={{ background:"#F5F6F4" }}>
-                  {["", "Nome", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => (
+                  {["", "Nome", "Cadastro", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => (
                     <th key={i} style={{ textAlign:"left", padding:"8px 10px",
                                          fontWeight:600, color:C.inkSoft, whiteSpace:"nowrap" }}>{h}</th>
                   ))}
@@ -1993,6 +2072,11 @@ function ImportarClientes({ ctx, onFechar }) {
                       </Tag>
                     </td>
                     <td style={{ padding:"7px 10px" }}>{r.bruto.nome || "—"}</td>
+                    <td style={{ padding:"7px 10px", whiteSpace:"nowrap",
+                                 color: r.dataInvalida ? C.late : C.inkSoft }}>
+                      {r.dados && r.dados.dataCadastro ? fmtBR(r.dados.dataCadastro)
+                        : r.dataInvalida ? "não entendi" : "—"}
+                    </td>
                     <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.telefone) || "—"}</td>
                     <td style={{ padding:"7px 10px" }}>{(r.dados && r.dados.area) || "—"}</td>
                     <td style={{ padding:"7px 10px" }}>{r.dados && r.dados.tema ? rotuloTema(r.dados) : "—"}</td>
@@ -2009,6 +2093,21 @@ function ImportarClientes({ ctx, onFechar }) {
           {previa.length > 60 && (
             <div style={{ fontSize:11.5, color:C.muted }}>
               Mostrando as 60 primeiras de {previa.length} linhas. A importação leva todas.
+            </div>
+          )}
+          {mapa.dataCadastro >= 0 ? (
+            previa.filter(r => r.dataInvalida).length > 0 && (
+              <div style={{ fontSize:12, color:C.late, lineHeight:1.55 }}>
+                {previa.filter(r => r.dataInvalida).length} linha(s) têm data em formato que não
+                reconheci. Essas fichas ficam com a data de hoje. O Zelo entende dd/mm/aaaa,
+                aaaa-mm-dd e célula formatada como data no Excel.
+              </div>
+            )
+          ) : (
+            <div style={{ fontSize:12, color:C.muted, lineHeight:1.55 }}>
+              Nenhuma coluna foi mapeada como <strong>Data do cadastro</strong>. Todas as fichas
+              vão entrar com a data de hoje e aparecer como um pico único no relatório de
+              cadastros recentes. Se a planilha tiver essa data, vale voltar e mapear.
             </div>
           )}
         </div>
@@ -2175,7 +2274,7 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
         <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",
                       gap:12, marginBottom:20 }}>
           {[["Telefone", c.telefone], ["E-mail", c.email], ["Etapa", c.estagio],
-            ["Proposta", brl(c.valorProposta)], ["Cadastro", fmtBR((c.criadoEm || "").slice(0,10))]]
+            ["Proposta", brl(c.valorProposta)], ["Cadastro", fmtBR(dataDeCadastro(c))]]
             .map(([r, v]) => (
               <div key={r}>
                 <div style={{ fontSize:11, color:C.muted, marginBottom:2 }}>{r}</div>
@@ -2801,15 +2900,27 @@ function useRelogio(ms = 30000) {
   return t;
 }
 
+/* Roda sobre milhares de follow-ups a cada atualização, então evita repetir
+   trabalho por item: a data de hoje e a hora saem uma vez só, e a chave de
+   ordenação é calculada junto com a linha em vez de dentro do comparador
+   (onde seria refeita ~2x por comparação). */
 function listarPendencias(clientes) {
+  const hoje = todayISO(), hm = agoraHM();
   const fila = [];
-  clientes.filter(c => !c.desfecho).forEach(c => {
-    (Array.isArray(c.followups) ? c.followups : []).forEach((f, i) => {
-      if (!f.feito) fila.push({ cliente: c, fup: f, indice: i,
-                                dias: diffDays(f.data), estado: slotStatus(f) });
-    });
+  clientes.forEach(c => {
+    if (c.desfecho) return;
+    const fups = Array.isArray(c.followups) ? c.followups : [];
+    for (let i = 0; i < fups.length; i++) {
+      const f = fups[i];
+      if (f.feito) continue;
+      fila.push({ cliente: c, fup: f, indice: i,
+                  dias: diffDays(f.data, hoje), estado: slotStatus(f, hoje, hm),
+                  chave: chaveFup(f) });
+    }
   });
-  return fila.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
+  /* chaveFup é ASCII (aaaa-mm-dd#hh:mm); comparação direta basta e é bem mais
+     barata que localeCompare. */
+  return fila.sort((a, b) => a.chave < b.chave ? -1 : a.chave > b.chave ? 1 : 0);
 }
 
 /* Agora cada cliente aparece até três vezes no mesmo dia — é essa a
@@ -2817,8 +2928,10 @@ function listarPendencias(clientes) {
    um por horário, porque é assim que a secretária trabalha: senta às
    8h e faz a lista das 8h. Misturar os três num "cobrar agora" só
    embaralha o que já tinha ordem.                                    */
-function filaDoDia(clientes, slotFiltro) {
-  let fila = listarPendencias(clientes);
+function filaDoDia(clientes, slotFiltro, filaPronta) {
+  /* filaPronta evita refazer a varredura quando quem chama já tem a lista
+     completa em mãos (o caso normal — só a busca da aba Follow-up muda a base). */
+  let fila = filaPronta || listarPendencias(clientes || []);
   if (slotFiltro && slotFiltro !== "todos") fila = fila.filter(p => slotDe(p.fup) === slotFiltro);
   const hoje = todayISO();
   const doDia = fila.filter(p => p.fup.data === hoje);
@@ -2972,7 +3085,11 @@ function Followup({ ctx }) {
         .join(" ").toLowerCase().includes(b));
   }, [clientes.itens, busca]);
 
-  const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
+  /* Sem busca, a base é exatamente a do Workspace e dá para reaproveitar a
+     varredura. Com busca, o conjunto muda e precisa ser refeito. */
+  const fila = useMemo(
+    () => filaDoDia(itens, slotFiltro, busca.trim() ? null : ctx.pendencias),
+    [itens, agora, slotFiltro, busca, ctx.pendencias]);
   const pendente = fila.atrasados.length + fila.vencidosHoje;
   const chavePg = busca + "|" + slotFiltro;
   const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
@@ -2984,7 +3101,8 @@ function Followup({ ctx }) {
   /* O aviso conta os toques do horário que acabou de chegar, sempre
      sobre a base inteira: filtrar a tela por horário ou digitar na
      busca não pode silenciar o aviso das 13h. */
-  const filaAvisos = useMemo(() => listarPendencias(clientes.itens), [clientes.itens, agora]);
+  /* O aviso sempre olha a base inteira, então é a lista do ctx sem filtro. */
+  const filaAvisos = ctx.pendencias || [];
   useAvisosDeSlot(filaAvisos, avisos);
   const alternarAvisos = async () => {
     if (avisos) { setAvisos(false); guardar(CHAVE_AVISO_LIGADO, "0"); return; }
@@ -3600,6 +3718,35 @@ function EventoForm({ ctx, ev, onFechar }) {
 /* ================================================================= *
  *  RELATÓRIOS
  * ================================================================= */
+/* Botõezinhos de escolha rápida — usados nos blocos de cadastros recentes. */
+function Segmento({ valor, opcoes, onEscolher }) {
+  return (
+    <div style={{ display:"inline-flex", border:`1px solid ${C.lineSoft}`,
+                  borderRadius:9, overflow:"hidden" }}>
+      {opcoes.map(([v, r]) => (
+        <button key={v} onClick={() => onEscolher(v)}
+                style={{ padding:"5px 11px", fontSize:12, cursor:"pointer", font:"inherit",
+                         fontWeight: valor === v ? 600 : 400, border:"none",
+                         background: valor === v ? C.ink : "transparent",
+                         color: valor === v ? "#fff" : C.inkSoft }}>{r}</button>
+      ))}
+    </div>
+  );
+}
+
+/* Resumo de uma linha para a lista de últimos cadastros. */
+const situacaoCadencia = (c) => {
+  if (c.desfecho === "ganho")   return { texto:"Ganho", cor:C.ok };
+  if (c.desfecho === "perdido") return { texto:"Perdido", cor:C.late };
+  const f = Array.isArray(c.followups) ? c.followups : [];
+  if (!f.length) return { texto:"Sem cadência", cor:C.muted };
+  const atrasados = f.filter(x => !x.feito && x.data < todayISO()).length;
+  if (atrasados) return { texto:`${atrasados} em atraso`, cor:C.late };
+  const feitos = f.filter(x => x.feito).length;
+  if (feitos === f.length) return { texto:"Cadência concluída", cor:C.muted };
+  return { texto:`${feitos} de ${f.length} contatos`, cor:C.brass };
+};
+
 function Barra({ rotulo: r, valor, total, cor = C.brass, extra, pct: pctProp }) {
   /* pctProp é usado quando o próprio valor já é uma porcentagem. */
   const bruto = pctProp != null ? pctProp : (total ? (Number(valor) / total) * 100 : 0);
@@ -3637,14 +3784,68 @@ function Relatorios({ ctx }) {
     return [addDays(hoje, -Number(periodo)), hoje];
   }, [periodo, de, ate]);
 
-  const base = useMemo(() => {
-    let l = clientes.itens.filter(c => {
-      const d = (c.criadoEm || "").slice(0,10);
-      return d >= ini && d <= fim;
-    });
-    if (P.relatorios === "proprios") l = l.filter(c => c.responsavel === perfil.uid);
-    return l;
-  }, [clientes.itens, ini, fim, P.relatorios, perfil.uid]);
+  /* Escopo respeita o papel do usuário mas ignora o período: os blocos de
+     "cadastros recentes" têm janela própria e precisam enxergar tudo. */
+  const escopo = useMemo(() => (
+    P.relatorios === "proprios"
+      ? clientes.itens.filter(c => c.responsavel === perfil.uid)
+      : clientes.itens
+  ), [clientes.itens, P.relatorios, perfil.uid]);
+
+  const base = useMemo(() => escopo.filter(c => {
+    const d = dataDeCadastro(c);
+    return d >= ini && d <= fim;
+  }), [escopo, ini, fim]);
+
+  /* ---- cadastros recentes: janela independente do filtro de período ---- */
+  const [janela, setJanela] = useState("15");
+  const [quantos, setQuantos] = useState("10");
+
+  const recentes = useMemo(() => {
+    const dias = Number(janela);
+    const hoje = todayISO();
+    const de1 = addDays(hoje, -(dias - 1));
+    const de0 = addDays(hoje, -(dias * 2 - 1));
+    const lista = escopo.filter(c => { const d = dataDeCadastro(c); return d >= de1 && d <= hoje; });
+    const antes = escopo.filter(c => { const d = dataDeCadastro(c); return d >= de0 && d < de1; });
+
+    const porDia = [];
+    for (let i = dias - 1; i >= 0; i--) {
+      const d = addDays(hoje, -i);
+      const doDia = lista.filter(c => dataDeCadastro(c) === d);
+      porDia.push({ data:d, total:doDia.length, importados:doDia.filter(c => c.importado).length });
+    }
+    const uteis = porDia.filter(d => ehDiaUtil(d.data));
+    const emUteis = uteis.reduce((s, d) => s + d.total, 0);
+
+    return {
+      dias, de: de1, ate: hoje, lista, porDia,
+      total: lista.length, antes: antes.length,
+      /* sem base anterior não existe variação — mostrar 100% seria mentira */
+      varia: antes.length ? Math.round(((lista.length - antes.length) / antes.length) * 100) : null,
+      pico: Math.max(1, ...porDia.map(d => d.total)),
+      importados: lista.filter(c => c.importado).length,
+      mediaUtil: uteis.length ? emUteis / uteis.length : 0
+    };
+  }, [escopo, janela]);
+
+  const contarPor = (arr, chave) => {
+    const m = {};
+    arr.forEach(c => { const k = chave(c); m[k] = (m[k] || 0) + 1; });
+    return Object.entries(m).map(([k, n]) => ({ k, n })).sort((a,b) => b.n - a.n);
+  };
+  const composicao = useMemo(() => ({
+    origem: contarPor(recentes.lista, c => rotulo(c.origem, c.origemOutro)),
+    tema:   contarPor(recentes.lista, c => c.tema || "Sem tema")
+  }), [recentes.lista]);
+
+  const ultimos = useMemo(() => (
+    [...escopo].sort((a, b) => {
+      const da = dataDeCadastro(a), db = dataDeCadastro(b);
+      if (da !== db) return db.localeCompare(da);
+      return String(b.criadoEm || "").localeCompare(String(a.criadoEm || ""));
+    }).slice(0, Number(quantos))
+  ), [escopo, quantos]);
 
   const ganhos    = base.filter(c => c.desfecho === "ganho");
   const perdidos  = base.filter(c => c.desfecho === "perdido");
@@ -3744,8 +3945,8 @@ function Relatorios({ ctx }) {
   /* tempo médio até o ganho */
   const tempoMedio = useMemo(() => {
     const dias = ganhos
-      .filter(c => c.criadoEm && c.desfechoEm)
-      .map(c => diffDays(c.desfechoEm.slice(0,10), c.criadoEm.slice(0,10)))
+      .filter(c => dataDeCadastro(c) && c.desfechoEm)
+      .map(c => diffDays(c.desfechoEm.slice(0,10), dataDeCadastro(c)))
       .filter(d => d >= 0);
     if (!dias.length) return null;
     return Math.round(dias.reduce((a,b) => a+b, 0) / dias.length);
@@ -3777,6 +3978,161 @@ function Relatorios({ ctx }) {
         {base.length} {base.length === 1 ? "lead cadastrado" : "leads cadastrados"} entre {fmtBR(ini)} e {fmtBR(fim)}
         {P.relatorios === "proprios" ? " · apenas os seus" : ""}
       </p>
+
+      {/* ---------------- cadastros recentes ---------------- */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(330px,1fr))",
+                    gap:16, marginBottom:16 }}>
+
+        <Card style={{ padding:20, gridColumn:"1 / -1" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginBottom:3 }}>
+            <div className="fr" style={{ fontSize:17, fontWeight:700, marginRight:"auto" }}>
+              Novos cadastros
+            </div>
+            <Segmento valor={janela} onEscolher={setJanela}
+                      opcoes={[["7","7 dias"],["15","15 dias"],["30","30 dias"]]} />
+          </div>
+          <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+            Fichas criadas entre {fmtBR(recentes.de)} e {fmtBR(recentes.ate)}.
+            Este bloco tem janela própria e não segue o filtro de período acima.
+          </p>
+
+          <div style={{ display:"flex", alignItems:"baseline", gap:14, flexWrap:"wrap", marginBottom:16 }}>
+            <div className="fr" style={{ fontSize:38, fontWeight:700, lineHeight:1 }}>
+              {recentes.total}
+            </div>
+            <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.6 }}>
+              {recentes.varia === null ? (
+                <>Sem cadastros nos {recentes.dias} dias anteriores — ainda não dá para comparar.</>
+              ) : (
+                <>
+                  <strong style={{ color: recentes.varia > 0 ? C.ok : recentes.varia < 0 ? C.late : C.muted }}>
+                    {recentes.varia > 0 ? "+" : ""}{recentes.varia}%
+                  </strong>{" "}
+                  contra {recentes.antes} nos {recentes.dias} dias anteriores
+                </>
+              )}
+              <br />
+              Média de {recentes.mediaUtil.toFixed(1).replace(".", ",")} por dia útil.
+            </div>
+          </div>
+
+          {/* uma barra por dia; a parte em latão é o que veio de importação */}
+          <div style={{ display:"flex", alignItems:"flex-end", gap: recentes.dias > 15 ? 3 : 6,
+                        height:96, marginBottom:6 }}>
+            {recentes.porDia.map(d => {
+              const alt = Math.round((d.total / recentes.pico) * 92);
+              const manual = d.total - d.importados;
+              return (
+                <div key={d.data} title={`${fmtBR(d.data)} · ${d.total} cadastro(s)${d.importados ? ` (${d.importados} importado(s))` : ""}`}
+                     style={{ flex:1, display:"flex", flexDirection:"column", justifyContent:"flex-end",
+                              height:"100%", minWidth:4 }}>
+                  {d.importados > 0 && (
+                    <div style={{ height: Math.round((d.importados / recentes.pico) * 92),
+                                  background:C.brass, borderRadius:"3px 3px 0 0" }} />
+                  )}
+                  <div style={{ height: Math.max(manual > 0 ? 2 : 0, Math.round((manual / recentes.pico) * 92)),
+                                background: ehDiaUtil(d.data) ? C.ink : C.muted,
+                                borderRadius: d.importados > 0 ? 0 : "3px 3px 0 0" }} />
+                  <div style={{ height:2, background: alt === 0 ? C.lineSoft : "transparent" }} />
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:10.5, color:C.muted }}>
+            <span>{fmtBR(recentes.de)}</span>
+            <span>pico do período: {recentes.pico}</span>
+            <span>{fmtBR(recentes.ate)}</span>
+          </div>
+
+          {recentes.importados > 0 && (
+            <p style={{ fontSize:11.5, color:C.muted, marginTop:12, lineHeight:1.6,
+                        paddingTop:12, borderTop:`1px solid ${C.lineSoft}` }}>
+              <span style={{ display:"inline-block", width:9, height:9, borderRadius:2,
+                             background:C.brass, marginRight:6 }} />
+              {recentes.importados} de {recentes.total} vieram de planilha. Fichas importadas sem
+              data de cadastro na origem entram no dia da importação — daí um pico isolado.
+            </p>
+          )}
+        </Card>
+
+        {/* composição da mesma janela */}
+        <Card style={{ padding:20 }}>
+          <div className="fr" style={{ fontSize:17, fontWeight:700, marginBottom:3 }}>
+            De onde vieram os últimos {recentes.dias} dias
+          </div>
+          <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+            O total sozinho diz que cresceu; isto diz por onde.
+          </p>
+          {composicao.origem.length === 0
+            ? <p style={{ fontSize:13, color:C.muted }}>Nenhum cadastro nesta janela.</p>
+            : composicao.origem.map(o => (
+                <Barra key={o.k} rotulo={o.k} valor={o.n} total={recentes.total} cor={C.ink} />
+              ))}
+        </Card>
+
+        <Card style={{ padding:20 }}>
+          <div className="fr" style={{ fontSize:17, fontWeight:700, marginBottom:3 }}>
+            Temas dos últimos {recentes.dias} dias
+          </div>
+          <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+            Assunto do que entrou na janela, para pegar mudança de demanda cedo.
+          </p>
+          {composicao.tema.length === 0
+            ? <p style={{ fontSize:13, color:C.muted }}>Nenhum cadastro nesta janela.</p>
+            : composicao.tema.map(t => (
+                <Barra key={t.k} rotulo={t.k} valor={t.n} total={recentes.total}
+                       cor={TEMA_COR[t.k] || C.muted} />
+              ))}
+        </Card>
+
+        {/* lista operacional */}
+        <Card style={{ padding:20, gridColumn:"1 / -1" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginBottom:3 }}>
+            <div className="fr" style={{ fontSize:17, fontWeight:700, marginRight:"auto" }}>
+              Últimos cadastros
+            </div>
+            <Segmento valor={quantos} onEscolher={setQuantos}
+                      opcoes={[["10","10"],["15","15"],["30","30"]]} />
+          </div>
+          <p style={{ fontSize:12, color:C.muted, marginBottom:14 }}>
+            As fichas mais recentes, na ordem de entrada. Clique para abrir.
+          </p>
+          {ultimos.length === 0 ? (
+            <p style={{ fontSize:13, color:C.muted }}>Nenhum cliente cadastrado ainda.</p>
+          ) : (
+            <div style={{ display:"grid", gap:8 }}>
+              {ultimos.map(c => {
+                const s = situacaoCadencia(c);
+                return (
+                  <button key={c.id} onClick={() => ctx.irParaCliente(c.id)}
+                          style={{ display:"flex", alignItems:"center", gap:12, flexWrap:"wrap",
+                                   textAlign:"left", width:"100%", cursor:"pointer",
+                                   background:"transparent", padding:"10px 12px", borderRadius:10,
+                                   border:`1px solid ${C.lineSoft}`, font:"inherit" }}>
+                    <span style={{ fontSize:11.5, color:C.muted, whiteSpace:"nowrap",
+                                   minWidth:74, fontVariantNumeric:"tabular-nums" }}>
+                      {fmtBR(dataDeCadastro(c))}
+                    </span>
+                    <span style={{ fontSize:13.5, fontWeight:600, marginRight:"auto" }}>
+                      {c.nome}
+                      <span style={{ display:"block", fontSize:11.5, fontWeight:400, color:C.muted, marginTop:2 }}>
+                        {rotulo(c.origem, c.origemOutro)}
+                        {c.tema ? ` · ${rotuloTema(c)}` : ""}
+                        {c.area ? ` · ${c.area}` : ""}
+                        {c.importado ? " · da planilha" : ""}
+                      </span>
+                    </span>
+                    <Tag cor={ESTAGIO_COR[c.estagio || "Novo lead"] || C.muted}>
+                      {c.estagio || "Novo lead"}
+                    </Tag>
+                    <Tag cor={s.cor}>{s.texto}</Tag>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      </div>
 
       {base.length === 0 ? (
         <Vazio titulo="Sem dados neste período"
