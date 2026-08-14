@@ -387,6 +387,7 @@ function(a,b,c){if(!Vd(b))throw Error(n(200));return Wd(null,a,b,!1,c)};Q.unmoun
 const {
   useState,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef
 } = React;
@@ -395,10 +396,13 @@ const {
  *  DEMONSTRAÇÃO — base de exemplo em memória, sem servidor.
  *  Nada do que você fizer aqui sai desta aba. O botão Reiniciar
  *  no topo devolve tudo ao estado original.
+ *  Arquivo gerado por gerar_demo.py a partir do index.html: só a
+ *  camada de dados muda, o resto é idêntico ao sistema real.
  * ================================================================= */
 const MASTER_EMAIL = "helena.sampaio@escritorio.com.br";
 const DEMO = true;
-const BUILD = "2026-08-10-e-demo";
+const BUILD = "2026-08-14-a-demo";
+const configOK = true;
 let STORE = {};
 const ouvintes = {};
 const notificar = p => (ouvintes[p] || []).forEach(fn => fn([...(STORE[p] || [])]));
@@ -581,6 +585,36 @@ const fmtBRhora = iso => {
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const brl = v => v ? `R$ ${Number(v).toLocaleString("pt-BR")}` : "—";
 
+/* Data que vale como "cadastro" nos relatorios.
+   criadoEm  = quando a ficha entrou no Zelo (carimbo de auditoria, nunca muda).
+   dataCadastro = quando o lead realmente chegou ao escritorio, vindo da planilha.
+   Sem o segundo campo, uma importacao em lote empilharia meses de historico
+   num unico dia e distorceria qualquer leitura de ritmo. */
+const dataDeCadastro = c => String(c && (c.dataCadastro || c.criadoEm) || "").slice(0, 10);
+
+/* feitoEm é gravado em ISO UTC (new Date().toISOString()). Um contato
+   relatado às 21h30 em São Paulo cai no dia seguinte quando lido em UTC.
+   O relatório do dia precisa do dia local, senão o fim da tarde de hoje
+   aparece no relatório de amanhã. */
+const diaLocal = iso => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? "" : toISO(d);
+};
+const horaLocal = iso => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? "" : `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+/* Quem relatou o contato. O primeiro a registrar fica como autor: se o
+   master corrigir a nota depois, o relatório do dia continua mostrando
+   quem de fato falou com a pessoa. */
+const autoriaRegistro = (f, perfil) => ({
+  porUid: f && f.porUid || perfil && perfil.uid || "",
+  porQuem: f && f.porQuem || perfil && (perfil.nome || perfil.email) || ""
+});
+
 /* ---- horário dos três toques diários ---- */
 const agoraHM = () => {
   const d = new Date();
@@ -590,13 +624,15 @@ const slotDe = f => f && f.slot || SLOT_PADRAO;
 const slotHora = f => slotDe(f).replace(":", "h");
 /* atrasado = passou do dia · agora = chegou a hora de hoje
    aguardando = ainda vai chegar hoje · futuro = outro dia         */
-const slotStatus = f => {
+/* hoje/hm são opcionais: quem chama em laço passa os dois já prontos,
+   quem chama avulso continua funcionando igual. */
+const slotStatus = (f, hoje, hm) => {
   if (!f) return "futuro";
   if (f.feito) return "feito";
-  const hoje = todayISO();
-  if (f.data < hoje) return "atrasado";
-  if (f.data > hoje) return "futuro";
-  return agoraHM() >= slotDe(f) ? "agora" : "aguardando";
+  const d = hoje || todayISO();
+  if (f.data < d) return "atrasado";
+  if (f.data > d) return "futuro";
+  return (hm || agoraHM()) >= slotDe(f) ? "agora" : "aguardando";
 };
 const SLOT_COR = {
   atrasado: "#B4472E",
@@ -1067,6 +1103,27 @@ function Modal({
   rodape,
   largura = 720
 }) {
+  /* Cada modal tem o SEU proprio nó no body.
+     Antes todos usavam document.body como container do portal. Quando dois
+     modais existiam ao mesmo tempo — a ficha do cliente e o modal de excluir,
+     por exemplo — e um commit desmontava um e montava outro, o React tentava
+     remover um nó que já não estava onde ele esperava e estourava
+     "removeChild: the node to be removed is not a child of this node".
+     Esse erro derruba o commit e faz o React refazer a árvore inteira, o que
+     no volume de hoje custa caro. Container isolado acaba com a classe toda. */
+  const [alvo] = useState(() => {
+    const el = document.createElement("div");
+    el.setAttribute("data-zelo-modal", "");
+    return el;
+  });
+  /* useLayoutEffect e não useEffect: o nó precisa estar no body antes da
+     pintura, senão o modal pisca no primeiro quadro. */
+  useLayoutEffect(() => {
+    document.body.appendChild(alvo);
+    return () => {
+      if (alvo.parentNode) alvo.parentNode.removeChild(alvo);
+    };
+  }, [alvo]);
   useEffect(() => {
     const before = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -1126,7 +1183,7 @@ function Modal({
   }, children), rodape && /*#__PURE__*/React.createElement("div", {
     className: "mdl-foot"
   }, rodape)));
-  return ReactDOM.createPortal(conteudo, document.body);
+  return ReactDOM.createPortal(conteudo, alvo);
 }
 function Tag({
   children,
@@ -1387,6 +1444,9 @@ const PERFIL_DEMO = {
   email: MASTER_EMAIL,
   papel: "master"
 };
+
+/* Sem login: a demo entra direto no Workspace como a advogada master.
+   O `key={versao}` faz o Reiniciar remontar a árvore inteira. */
 function App() {
   const [versao, setVersao] = useState(0);
   const [avisoVisivel, setAvisoVisivel] = useState(true);
@@ -1769,15 +1829,18 @@ function Workspace({
   /* contatos vencidos ou com a hora já batida — o relógio entra na
      conta para o número virar sozinho às 8h, 13h e 17h */
   const tique = useRelogio();
+  /* Varredura única da base. Painel e Follow-up recebem esta lista pelo ctx
+     em vez de refazer a própria — eram quatro passadas por ciclo. */
+  const pendencias = useMemo(() => listarPendencias(clientes.itens), [clientes.itens, tique]);
   const pendentes = useMemo(() => {
-    const f = filaDoDia(clientes.itens, "todos");
+    const f = filaDoDia(null, "todos", pendencias);
     return {
       atrasados: f.atrasados.length,
       agora: f.vencidosHoje,
       hoje: f.hojeTotal,
       total: f.atrasados.length + f.vencidosHoje
     };
-  }, [clientes.itens, tique]);
+  }, [pendencias]);
 
   /* o contador também vai para o título da aba do navegador */
   useEffect(() => {
@@ -1817,6 +1880,10 @@ function Workspace({
     nome: "Usuários",
     icone: Icon.users
   }] : [])];
+
+  /* Relatórios precisa conseguir abrir a ficha de um cliente que está em outra
+     aba. Guardamos o id aqui e a aba Clientes consome e limpa. */
+  const [foco, setFoco] = useState(null);
   const ctx = {
     user,
     perfil,
@@ -1825,7 +1892,14 @@ function Workspace({
     processos,
     eventos,
     pendentes,
-    irPara: setAba
+    pendencias,
+    irPara: setAba,
+    foco,
+    limparFoco: () => setFoco(null),
+    irParaCliente: id => {
+      setFoco(id);
+      setAba("clientes");
+    }
   };
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2071,22 +2145,17 @@ function Painel({
     eventos,
     perfil,
     P,
-    irPara
+    irPara,
+    pendencias
   } = ctx;
   const hoje = todayISO();
-  const emAberto = clientes.itens.filter(c => !c.desfecho);
-  useRelogio();
-  const fups = [];
-  emAberto.forEach(c => {
-    (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
-      const e = slotStatus(f);
-      if (e === "atrasado" || e === "agora") fups.push({
-        cliente: c,
-        fup: f
-      });
-    });
-  });
-  fups.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
+  const emAberto = useMemo(() => clientes.itens.filter(c => !c.desfecho), [clientes.itens]);
+
+  /* Antes esta varredura ficava solta no corpo do componente: refazia a base
+     inteira a cada renderização, e o useRelogio local forçava uma a cada 30 s.
+     Agora reaproveita a lista já ordenada do Workspace, que também é quem
+     dispara a atualização de horário. */
+  const fups = useMemo(() => (pendencias || []).filter(p => p.estado === "atrasado" || p.estado === "agora"), [pendencias]);
   const prazos = [];
   processos.itens.forEach(pr => {
     (pr.prazos || []).forEach((pz, i) => {
@@ -2196,7 +2265,8 @@ function Painel({
     }
   }, "Nenhum contato pendente. Cadência em dia.") : fups.slice(0, 6).map(({
     cliente,
-    fup
+    fup,
+    estado
   }) => /*#__PURE__*/React.createElement("button", {
     key: cliente.id + chaveFup(fup),
     onClick: () => irPara("followup"),
@@ -2230,8 +2300,8 @@ function Painel({
       color: C.muted
     }
   }, "D", fup.dia, " · ", slotHora(fup), " · ", cliente.telefone || cliente.email || "sem contato")), /*#__PURE__*/React.createElement(Tag, {
-    cor: SLOT_COR[slotStatus(fup)]
-  }, slotStatus(fup) === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora")))), /*#__PURE__*/React.createElement(Card, {
+    cor: SLOT_COR[estado]
+  }, estado === "atrasado" ? `${Math.abs(diffDays(fup.data))}d atrás` : "agora")))), /*#__PURE__*/React.createElement(Card, {
     style: {
       padding: 18
     }
@@ -2430,6 +2500,17 @@ function Clientes({
   const [detalhe, setDetalhe] = useState(null);
   const [importando, setImportando] = useState(false);
   const [filtroTema, setFiltroTema] = useState("todos");
+
+  /* Veio de outra aba pedindo um cliente específico: abre a ficha direto e
+     solta o filtro, para que ele continue visível ao fechar o modal. */
+  useEffect(() => {
+    if (!ctx.foco) return;
+    setDetalhe(ctx.foco);
+    setFiltro("todos");
+    setFiltroTema("todos");
+    setBusca("");
+    ctx.limparFoco();
+  }, [ctx.foco]);
   const lista = useMemo(() => {
     let l = clientes.itens;
     if (filtro === "abertos") l = l.filter(c => !c.desfecho);
@@ -3095,6 +3176,15 @@ const CAMPOS_IMPORT = [{
   id: "observacoes",
   rotulo: "Observações",
   apelidos: ["observacao", "observacoes", "obs", "anotacoes", "anotacao", "detalhes", "descricao", "historico", "resumo"]
+},
+/* Fica por último de propósito: os outros campos escolhem a coluna deles
+   primeiro, e "data"/"entrada" só valem em correspondência exata para não
+   roubar uma coluna de "data de nascimento" ou "data da audiência". */
+{
+  id: "dataCadastro",
+  rotulo: "Data do cadastro",
+  apelidos: ["data do cadastro", "data cadastro", "data de cadastro", "data de entrada", "data do lead", "data do contato", "data da entrada", "dt cadastro", "cadastrado em", "criado em", "entrada", "data"],
+  soExato: ["entrada", "data"]
 }];
 const adivinharColunas = cabecalho => {
   const norm = cabecalho.map(semAcento);
@@ -3108,7 +3198,7 @@ const adivinharColunas = cabecalho => {
       if (i >= 0) achou = i;
     });
     if (achou < 0) campo.apelidos.forEach(ap => {
-      if (achou >= 0 || ap.length < 3) return;
+      if (achou >= 0 || ap.length < 3 || (campo.soExato || []).includes(ap)) return;
       const i = norm.findIndex((h, idx) => !usadas.has(idx) && h.includes(ap));
       if (i >= 0) achou = i;
     });
@@ -3154,15 +3244,31 @@ const valorParaReais = bruto => {
   return isFinite(n) && n > 0 ? Math.round(n) : "";
 };
 
-/* Data em dd/mm/aaaa, dd-mm-aaaa ou aaaa-mm-dd. */
+/* Data vinda de planilha. Além do texto em formato brasileiro, o SheetJS pode
+   devolver um objeto Date ou o número serial do Excel — virar texto antes de
+   olhar o tipo destruiria esses dois casos. Data implausível é descartada:
+   melhor a ficha cair no criadoEm do que sujar o relatório. */
 const dataParaISO = bruto => {
-  const t = String(bruto == null ? "" : bruto).trim();
-  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  if (bruto == null || bruto === "") return "";
+  const plausivel = iso => iso >= "2000-01-01" && iso <= addDays(todayISO(), 1) ? iso : "";
+  if (bruto instanceof Date && !isNaN(bruto.getTime())) return plausivel(toISO(bruto));
+  if (typeof bruto === "number" && isFinite(bruto)) {
+    if (bruto < 1 || bruto > 60000) return "";
+    const d = new Date(Math.round((bruto - 25569) * 86400000));
+    if (isNaN(d.getTime())) return "";
+    return plausivel(toISO(new Date(d.getTime() + d.getTimezoneOffset() * 60000)));
+  }
+  const t = String(bruto).trim();
+  if (!t) return "";
+  let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return plausivel(`${m[1]}-${pad(Number(m[2]))}-${pad(Number(m[3]))}`);
   m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
   if (m) {
-    const ano = m[3].length === 2 ? `20${m[3]}` : m[3];
-    return `${ano}-${pad(Number(m[2]))}-${pad(Number(m[1]))}`;
+    const dia = Number(m[1]),
+      mes = Number(m[2]);
+    if (mes < 1 || mes > 12 || dia < 1 || dia > 31) return "";
+    const ano = m[3].length === 2 ? Number(m[3]) > 70 ? `19${m[3]}` : `20${m[3]}` : m[3];
+    return plausivel(`${ano}-${pad(mes)}-${pad(dia)}`);
   }
   return "";
 };
@@ -3268,6 +3374,12 @@ function ImportarClientes({
         const idx = mapa[id];
         return idx >= 0 ? String(linha[idx] == null ? "" : linha[idx]).trim() : "";
       };
+      /* Data precisa do valor cru: o SheetJS pode entregar Date ou serial,
+         e converter para texto antes destruiria os dois casos. */
+      const pegaCru = id => {
+        const idx = mapa[id];
+        return idx >= 0 ? linha[idx] : null;
+      };
       const nome = pega("nome");
       const bruto = {
         nome,
@@ -3279,7 +3391,8 @@ function ImportarClientes({
         origem: pega("origem"),
         estagio: pega("estagio"),
         valorProposta: pega("valorProposta"),
-        observacoes: pega("observacoes")
+        observacoes: pega("observacoes"),
+        dataCadastro: pega("dataCadastro")
       };
       if (!nome) return {
         i,
@@ -3310,6 +3423,10 @@ function ImportarClientes({
       /* Área que não bate com a lista não é jogada fora: vira anotação. */
       const notas = [bruto.observacoes];
       if (bruto.area && !area) notas.push(`Área na planilha: ${bruto.area}`);
+
+      /* Data do cadastro na planilha. Vazio aqui significa "usa o criadoEm". */
+      const dataCadastro = dataParaISO(pegaCru("dataCadastro"));
+      const dataInvalida = mapa.dataCadastro >= 0 && !!bruto.dataCadastro && !dataCadastro;
       const dados = {
         nome,
         telefone: maskTel(bruto.telefone),
@@ -3320,6 +3437,7 @@ function ImportarClientes({
         temaOutro,
         origem,
         origemOutro,
+        dataCadastro,
         estagio,
         valorProposta: valorParaReais(bruto.valorProposta),
         observacoes: notas.filter(Boolean).join("\n")
@@ -3328,6 +3446,7 @@ function ImportarClientes({
         i,
         bruto,
         dados,
+        dataInvalida,
         status: dup ? "duplicado" : "novo"
       };
     });
@@ -3643,7 +3762,7 @@ function ImportarClientes({
     style: {
       background: "#F5F6F4"
     }
-  }, ["", "Nome", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => /*#__PURE__*/React.createElement("th", {
+  }, ["", "Nome", "Cadastro", "Telefone", "Área", "Tema", "Origem", "Etapa", "Valor"].map((h, i) => /*#__PURE__*/React.createElement("th", {
     key: i,
     style: {
       textAlign: "left",
@@ -3669,6 +3788,12 @@ function ImportarClientes({
       padding: "7px 10px"
     }
   }, r.bruto.nome || "—"), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px",
+      whiteSpace: "nowrap",
+      color: r.dataInvalida ? C.late : C.inkSoft
+    }
+  }, r.dados && r.dados.dataCadastro ? fmtBR(r.dados.dataCadastro) : r.dataInvalida ? "não entendi" : "—"), /*#__PURE__*/React.createElement("td", {
     style: {
       padding: "7px 10px"
     }
@@ -3697,7 +3822,19 @@ function ImportarClientes({
       fontSize: 11.5,
       color: C.muted
     }
-  }, "Mostrando as 60 primeiras de ", previa.length, " linhas. A importação leva todas.")), etapa === "gravando" && /*#__PURE__*/React.createElement("div", {
+  }, "Mostrando as 60 primeiras de ", previa.length, " linhas. A importação leva todas."), mapa.dataCadastro >= 0 ? previa.filter(r => r.dataInvalida).length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.late,
+      lineHeight: 1.55
+    }
+  }, previa.filter(r => r.dataInvalida).length, " linha(s) têm data em formato que não reconheci. Essas fichas ficam com a data de hoje. O Zelo entende dd/mm/aaaa, aaaa-mm-dd e célula formatada como data no Excel.") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      lineHeight: 1.55
+    }
+  }, "Nenhuma coluna foi mapeada como ", /*#__PURE__*/React.createElement("strong", null, "Data do cadastro"), ". Todas as fichas vão entrar com a data de hoje e aparecer como um pico único no relatório de cadastros recentes. Se a planilha tiver essa data, vale voltar e mapear.")), etapa === "gravando" && /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "24px 4px",
       textAlign: "center"
@@ -3792,7 +3929,8 @@ function ClienteDetalhe({
   const salvarRegistro = (i, dados) => {
     const novos = fups.map((f, k) => k === i ? {
       ...f,
-      ...dados
+      ...dados,
+      ...autoriaRegistro(f, perfil)
     } : f);
     clientes.atualizar(id, {
       followups: novos
@@ -3806,7 +3944,9 @@ function ClienteDetalhe({
       canal: "",
       canalOutro: "",
       semResposta: false,
-      nota: ""
+      nota: "",
+      porUid: "",
+      porQuem: ""
     } : f);
     clientes.atualizar(id, {
       followups: novos
@@ -3841,7 +3981,9 @@ function ClienteDetalhe({
       canalOutro: f.canalOutro || "",
       semResposta: !!f.semResposta,
       nota: f.nota || "",
-      feitoEm: f.feitoEm || null
+      feitoEm: f.feitoEm || null,
+      porQuem: f.porQuem || "",
+      porUid: f.porUid || ""
     }));
     clientes.atualizar(id, {
       followups: gerarFollowups(todayISO()),
@@ -3933,7 +4075,7 @@ function ClienteDetalhe({
       gap: 12,
       marginBottom: 20
     }
-  }, [["Telefone", c.telefone], ["E-mail", c.email], ["Etapa", c.estagio], ["Proposta", brl(c.valorProposta)], ["Cadastro", fmtBR((c.criadoEm || "").slice(0, 10))]].map(([r, v]) => /*#__PURE__*/React.createElement("div", {
+  }, [["Telefone", c.telefone], ["E-mail", c.email], ["Etapa", c.estagio], ["Proposta", brl(c.valorProposta)], ["Cadastro", fmtBR(dataDeCadastro(c))]].map(([r, v]) => /*#__PURE__*/React.createElement("div", {
     key: r
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -4946,20 +5088,34 @@ function useRelogio(ms = 30000) {
   }, [ms]);
   return t;
 }
+
+/* Roda sobre milhares de follow-ups a cada atualização, então evita repetir
+   trabalho por item: a data de hoje e a hora saem uma vez só, e a chave de
+   ordenação é calculada junto com a linha em vez de dentro do comparador
+   (onde seria refeita ~2x por comparação). */
 function listarPendencias(clientes) {
+  const hoje = todayISO(),
+    hm = agoraHM();
   const fila = [];
-  clientes.filter(c => !c.desfecho).forEach(c => {
-    (Array.isArray(c.followups) ? c.followups : []).forEach((f, i) => {
-      if (!f.feito) fila.push({
+  clientes.forEach(c => {
+    if (c.desfecho) return;
+    const fups = Array.isArray(c.followups) ? c.followups : [];
+    for (let i = 0; i < fups.length; i++) {
+      const f = fups[i];
+      if (f.feito) continue;
+      fila.push({
         cliente: c,
         fup: f,
         indice: i,
-        dias: diffDays(f.data),
-        estado: slotStatus(f)
+        dias: diffDays(f.data, hoje),
+        estado: slotStatus(f, hoje, hm),
+        chave: chaveFup(f)
       });
-    });
+    }
   });
-  return fila.sort((a, b) => chaveFup(a.fup).localeCompare(chaveFup(b.fup)));
+  /* chaveFup é ASCII (aaaa-mm-dd#hh:mm); comparação direta basta e é bem mais
+     barata que localeCompare. */
+  return fila.sort((a, b) => a.chave < b.chave ? -1 : a.chave > b.chave ? 1 : 0);
 }
 
 /* Agora cada cliente aparece até três vezes no mesmo dia — é essa a
@@ -4967,8 +5123,10 @@ function listarPendencias(clientes) {
    um por horário, porque é assim que a secretária trabalha: senta às
    8h e faz a lista das 8h. Misturar os três num "cobrar agora" só
    embaralha o que já tinha ordem.                                    */
-function filaDoDia(clientes, slotFiltro) {
-  let fila = listarPendencias(clientes);
+function filaDoDia(clientes, slotFiltro, filaPronta) {
+  /* filaPronta evita refazer a varredura quando quem chama já tem a lista
+     completa em mãos (o caso normal — só a busca da aba Follow-up muda a base). */
+  let fila = filaPronta || listarPendencias(clientes || []);
   if (slotFiltro && slotFiltro !== "todos") fila = fila.filter(p => slotDe(p.fup) === slotFiltro);
   const hoje = todayISO();
   const doDia = fila.filter(p => p.fup.data === hoje);
@@ -5203,7 +5361,10 @@ function Followup({
     if (!b) return clientes.itens;
     return clientes.itens.filter(c => [c.nome, c.telefone, c.email, c.area, c.tema, c.temaOutro].join(" ").toLowerCase().includes(b));
   }, [clientes.itens, busca]);
-  const fila = useMemo(() => filaDoDia(itens, slotFiltro), [itens, agora, slotFiltro]);
+
+  /* Sem busca, a base é exatamente a do Workspace e dá para reaproveitar a
+     varredura. Com busca, o conjunto muda e precisa ser refeito. */
+  const fila = useMemo(() => filaDoDia(itens, slotFiltro, busca.trim() ? null : ctx.pendencias), [itens, agora, slotFiltro, busca, ctx.pendencias]);
   const pendente = fila.atrasados.length + fila.vencidosHoje;
   const chavePg = busca + "|" + slotFiltro;
   const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
@@ -5215,7 +5376,8 @@ function Followup({
   /* O aviso conta os toques do horário que acabou de chegar, sempre
      sobre a base inteira: filtrar a tela por horário ou digitar na
      busca não pode silenciar o aviso das 13h. */
-  const filaAvisos = useMemo(() => listarPendencias(clientes.itens), [clientes.itens, agora]);
+  /* O aviso sempre olha a base inteira, então é a lista do ctx sem filtro. */
+  const filaAvisos = ctx.pendencias || [];
   useAvisosDeSlot(filaAvisos, avisos);
   const alternarAvisos = async () => {
     if (avisos) {
@@ -5258,7 +5420,9 @@ function Followup({
         canalOutro: f.canalOutro || "",
         semResposta: !!f.semResposta,
         nota: f.nota || "",
-        feitoEm: f.feitoEm || null
+        feitoEm: f.feitoEm || null,
+        porQuem: f.porQuem || "",
+        porUid: f.porUid || ""
       }));
       clientes.atualizar(c.id, {
         followups: gerarFollowups(todayISO()),
@@ -5271,7 +5435,8 @@ function Followup({
   const salvar = (cliente, i, dados) => {
     const novos = (Array.isArray(cliente.followups) ? cliente.followups : []).map((f, k) => k === i ? {
       ...f,
-      ...dados
+      ...dados,
+      ...autoriaRegistro(f, perfil)
     } : f);
     clientes.atualizar(cliente.id, {
       followups: novos
@@ -6373,6 +6538,65 @@ function EventoForm({
 /* ================================================================= *
  *  RELATÓRIOS
  * ================================================================= */
+/* Botõezinhos de escolha rápida — usados nos blocos de cadastros recentes. */
+function Segmento({
+  valor,
+  opcoes,
+  onEscolher
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "inline-flex",
+      border: `1px solid ${C.lineSoft}`,
+      borderRadius: 9,
+      overflow: "hidden"
+    }
+  }, opcoes.map(([v, r]) => /*#__PURE__*/React.createElement("button", {
+    key: v,
+    onClick: () => onEscolher(v),
+    style: {
+      padding: "5px 11px",
+      fontSize: 12,
+      cursor: "pointer",
+      font: "inherit",
+      fontWeight: valor === v ? 600 : 400,
+      border: "none",
+      background: valor === v ? C.ink : "transparent",
+      color: valor === v ? "#fff" : C.inkSoft
+    }
+  }, r)));
+}
+
+/* Resumo de uma linha para a lista de últimos cadastros. */
+const situacaoCadencia = c => {
+  if (c.desfecho === "ganho") return {
+    texto: "Ganho",
+    cor: C.ok
+  };
+  if (c.desfecho === "perdido") return {
+    texto: "Perdido",
+    cor: C.late
+  };
+  const f = Array.isArray(c.followups) ? c.followups : [];
+  if (!f.length) return {
+    texto: "Sem cadência",
+    cor: C.muted
+  };
+  const atrasados = f.filter(x => !x.feito && x.data < todayISO()).length;
+  if (atrasados) return {
+    texto: `${atrasados} em atraso`,
+    cor: C.late
+  };
+  const feitos = f.filter(x => x.feito).length;
+  if (feitos === f.length) return {
+    texto: "Cadência concluída",
+    cor: C.muted
+  };
+  return {
+    texto: `${feitos} de ${f.length} contatos`,
+    cor: C.brass
+  };
+};
 function Barra({
   rotulo: r,
   valor,
@@ -6436,6 +6660,473 @@ function Barra({
     }
   })));
 }
+
+/* ================================================================= *
+ *  RELATÓRIO DIÁRIO DE LIGAÇÕES
+ *  Tudo que foi falado e relatado num dia, na ordem em que aconteceu.
+ * ================================================================= */
+
+/* Varre ciclo atual, ciclos anteriores e o histórico da cadência antiga.
+   Contato sem feitoEm (base antiga ou migrada) cai no dia programado —
+   é a melhor aproximação possível e a linha avisa que não tem horário. */
+function registrosDoDia(lista, dia) {
+  const linhas = [];
+  (lista || []).forEach(c => {
+    const juntar = (f, origem) => {
+      if (!f || !f.feito) return;
+      const d = diaLocal(f.feitoEm) || f.data || "";
+      if (d !== dia) return;
+      linhas.push({
+        clienteId: c.id,
+        cliente: c.nome || "(sem nome)",
+        telefone: c.telefone || "",
+        dia: f.dia || null,
+        /* Sem slot é contato da cadência antiga, que não tinha horário fixo.
+           Empurrar para as 08h fingiria uma informação que não existe: cai
+           no bloco "fora dos três horários". */
+        slot: f.slot || "",
+        hora: horaLocal(f.feitoEm),
+        semHora: !f.feitoEm,
+        canalBase: f.canal || "",
+        canal: f.canal === "Outro" ? f.canalOutro || "Outro" : f.canal || "Não informado",
+        semResposta: !!f.semResposta,
+        nota: String(f.nota || "").trim(),
+        quem: f.porQuem || "",
+        origem
+      });
+    };
+    (Array.isArray(c.followups) ? c.followups : []).forEach(f => juntar(f, ""));
+    (c.historicoCiclos || []).forEach(h => (h.followups || []).forEach(f => juntar(f, "ciclo anterior")));
+    (c.contatosAnteriores || []).forEach(f => juntar({
+      ...f,
+      feito: true
+    }, "cadência antiga"));
+  });
+  return linhas.sort((a, b) => (a.hora || "99:99").localeCompare(b.hora || "99:99") || a.cliente.localeCompare(b.cliente));
+}
+
+/* O outro lado da conta: toques marcados para o dia que ninguém relatou. */
+function naoRelatadosDoDia(lista, dia) {
+  const out = [];
+  (lista || []).forEach(c => {
+    if (c.desfecho) return;
+    (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
+      if (f.feito || f.data !== dia) return;
+      out.push({
+        clienteId: c.id,
+        cliente: c.nome || "(sem nome)",
+        telefone: c.telefone || "",
+        dia: f.dia || null,
+        slot: slotDe(f)
+      });
+    });
+  });
+  return out.sort((a, b) => a.slot.localeCompare(b.slot) || a.cliente.localeCompare(b.cliente));
+}
+function LinhaRegistro({
+  r,
+  onAbrir
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 5,
+      padding: "11px 13px",
+      borderRadius: 10,
+      border: `1px solid ${C.lineSoft}`,
+      background: "#fff"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12.5,
+      fontWeight: 700,
+      color: C.ink,
+      minWidth: 42,
+      fontVariantNumeric: "tabular-nums"
+    }
+  }, r.hora || "—"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => onAbrir(r.clienteId),
+    style: {
+      background: "transparent",
+      border: "none",
+      padding: 0,
+      font: "inherit",
+      fontSize: 13.5,
+      fontWeight: 600,
+      color: C.ink,
+      cursor: "pointer",
+      textAlign: "left",
+      marginRight: "auto"
+    }
+  }, r.cliente), /*#__PURE__*/React.createElement(Tag, {
+    cor: CANAL_COR[r.canalBase] || C.muted
+  }, r.canal), /*#__PURE__*/React.createElement(Tag, {
+    cor: r.semResposta ? C.late : C.ok,
+    forte: !r.semResposta
+  }, r.semResposta ? "não atendeu" : "falou")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted
+    }
+  }, r.telefone || "sem telefone", r.dia ? ` · D${r.dia}` : "", r.origem ? ` · ${r.origem}` : "", r.quem ? ` · por ${r.quem}` : " · autor não registrado", r.semHora ? " · sem horário de registro" : ""), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      lineHeight: 1.55,
+      color: r.nota ? C.inkSoft : C.muted,
+      fontStyle: r.nota ? "normal" : "italic"
+    }
+  }, r.nota || (r.semResposta ? "Sem observação." : "Sem relato.")));
+}
+function RelatorioLigacoes({
+  ctx,
+  escopo
+}) {
+  const [dia, setDia] = useState(todayISO());
+  const [aviso, setAviso] = useState("");
+  const regs = useMemo(() => registrosDoDia(escopo, dia), [escopo, dia]);
+  const abertos = useMemo(() => naoRelatadosDoDia(escopo, dia), [escopo, dia]);
+  const falados = regs.filter(r => !r.semResposta).length;
+  const mudos = regs.length - falados;
+  const porSlot = SLOTS.map(s => ({
+    slot: s,
+    itens: regs.filter(r => r.slot === s)
+  }));
+  /* Contatos sem horário fixo (cadência antiga) ficam num bloco à parte. */
+  const foraDaGrade = regs.filter(r => SLOTS.indexOf(r.slot) === -1);
+  const agrupar = chave => {
+    const m = {};
+    regs.forEach(r => {
+      const k = chave(r) || "—";
+      m[k] = (m[k] || 0) + 1;
+    });
+    return Object.entries(m).map(([k, n]) => ({
+      k,
+      n
+    })).sort((a, b) => b.n - a.n);
+  };
+  const porCanal = useMemo(() => agrupar(r => r.canal), [regs]);
+  const porQuem = useMemo(() => agrupar(r => r.quem), [regs]);
+  const semAutor = regs.filter(r => !r.quem).length;
+  const rotSlot = s => s ? `${s.replace(":", "h")} · ${SLOT_NOME[s] || ""}` : "sem horário fixo";
+  const baixarCSV = () => {
+    const esc = v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+    const cab = ["Data", "Hora", "Cliente", "Telefone", "Dia da cadência", "Horário do toque", "Canal", "Desfecho", "Quem registrou", "Relato"];
+    const linhas = regs.map(r => [fmtBR(dia), r.hora || "", r.cliente, r.telefone, r.dia ? "D" + r.dia : "", rotSlot(r.slot), r.canal, r.semResposta ? "Não conseguiu falar" : "Falou", r.quem || "", r.nota]);
+    const txt = [cab, ...linhas].map(l => l.map(esc).join(";")).join("\r\n");
+    const blob = new Blob(["\uFEFF" + txt], {
+      type: "text/csv;charset=utf-8"
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ligacoes-${dia}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  };
+
+  /* Impressão numa janela limpa: imprimir a tela inteira levaria menu,
+     cabeçalho e os outros relatórios junto. */
+  const imprimir = () => {
+    const w = window.open("", "_blank");
+    if (!w) {
+      setAviso("O navegador bloqueou a janela de impressão. Libere pop-ups para este endereço e tente de novo.");
+      return;
+    }
+    setAviso("");
+    const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const linhas = regs.map(r => `<tr>
+      <td class="n">${esc(r.hora || "—")}</td>
+      <td><strong>${esc(r.cliente)}</strong><br><span class="m">${esc(r.telefone || "sem telefone")}${r.dia ? " · D" + r.dia : ""}</span></td>
+      <td class="n">${esc(rotSlot(r.slot))}</td>
+      <td>${esc(r.canal)}</td>
+      <td>${r.semResposta ? "não atendeu" : "falou"}</td>
+      <td>${esc(r.quem || "—")}</td>
+      <td>${esc(r.nota || "—")}</td></tr>`).join("");
+    const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>Ligações de ${fmtBR(dia)} · Zelo</title><style>
+*{box-sizing:border-box}
+body{font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;color:#15243B;margin:26px}
+h1{font-size:19px;margin:0 0 2px}
+.sub{color:#6F7A87;font-size:12px;margin:0 0 16px}
+.kpi{display:flex;gap:22px;margin:0 0 16px;padding:12px 0;border-top:1px solid #DAD9CF;border-bottom:1px solid #DAD9CF}
+.kpi div{font-size:11px;color:#6F7A87}
+.kpi b{display:block;font-size:20px;color:#15243B}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;color:#6F7A87;border-bottom:1px solid #DAD9CF;padding:6px 6px}
+td{border-bottom:1px solid #E6E7E2;padding:8px 6px;vertical-align:top}
+.n{white-space:nowrap}
+.m{color:#6F7A87;font-size:11px}
+footer{margin-top:22px;font-size:10.5px;color:#6F7A87;border-top:1px solid #DAD9CF;padding-top:10px}
+@media print{body{margin:12mm}}
+</style></head><body>
+<h1>Relatório de contatos — ${fmtBR(dia)}</h1>
+<p class="sub">Zelo · CRM Jurídico${ctx.perfil && ctx.perfil.nome ? " · emitido por " + esc(ctx.perfil.nome) : ""}</p>
+<div class="kpi">
+  <div>Contatos registrados<b>${regs.length}</b></div>
+  <div>Falaram com a pessoa<b>${falados}</b></div>
+  <div>Não atenderam<b>${mudos}</b></div>
+  <div>Toques do dia sem registro<b>${abertos.length}</b></div>
+</div>
+${regs.length ? `<table><thead><tr><th>Hora</th><th>Cliente</th><th>Toque</th><th>Canal</th><th>Desfecho</th><th>Quem registrou</th><th>Relato</th></tr></thead><tbody>${linhas}</tbody></table>` : `<p>Nenhum contato foi registrado neste dia.</p>`}
+<footer>Zelo · uma solução Jordão &amp; Co · gerado em ${fmtBRhora(new Date().toISOString())}</footer>
+</body></html>`;
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+    setTimeout(() => {
+      try {
+        w.print();
+      } catch (e) {}
+    }, 400);
+  };
+  return /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20,
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+      marginBottom: 3
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginRight: "auto"
+    }
+  }, "Ligações do dia"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: () => setDia(todayISO())
+  }, "Hoje"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: () => setDia(addDays(todayISO(), -1))
+  }, "Ontem"), /*#__PURE__*/React.createElement(Inp, {
+    type: "date",
+    value: dia,
+    max: todayISO(),
+    onChange: e => setDia(e.target.value || todayISO()),
+    style: {
+      maxWidth: 160
+    }
+  })), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "Todo contato relatado em ", fmtBR(dia), ", na ordem em que foi registrado. Este bloco tem data própria e não segue o filtro de período acima."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))",
+      gap: 12,
+      marginBottom: 16
+    }
+  }, [{
+    r: "Contatos registrados",
+    v: regs.length,
+    c: C.ink
+  }, {
+    r: "Falaram com a pessoa",
+    v: falados,
+    c: C.ok
+  }, {
+    r: "Não atenderam",
+    v: mudos,
+    c: C.late
+  }, {
+    r: "Toques sem registro",
+    v: abertos.length,
+    c: abertos.length ? C.brass : C.muted
+  }].map(n => /*#__PURE__*/React.createElement("div", {
+    key: n.r,
+    style: {
+      border: `1px solid ${C.lineSoft}`,
+      borderRadius: 10,
+      padding: "13px 15px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 24,
+      fontWeight: 700,
+      color: n.c,
+      lineHeight: 1.15
+    }
+  }, n.v), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginTop: 4
+    }
+  }, n.r)))), regs.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 18,
+      flexWrap: "wrap",
+      fontSize: 12,
+      color: C.muted,
+      paddingBottom: 14,
+      marginBottom: 14,
+      borderBottom: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: C.inkSoft
+    }
+  }, "Por canal:"), " ", porCanal.map(x => `${x.k} ${x.n}`).join(" · ")), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: C.inkSoft
+    }
+  }, "Quem registrou:"), " ", porQuem.filter(x => x.k !== "—").length ? porQuem.filter(x => x.k !== "—").map(x => `${x.k} ${x.n}`).join(" · ") : "não identificado", semAutor > 0 && porQuem.filter(x => x.k !== "—").length ? ` · sem autor ${semAutor}` : "")), regs.length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted,
+      padding: "10px 0"
+    }
+  }, "Nenhum contato foi registrado em ", fmtBR(dia), ".", abertos.length > 0 && ` ${abertos.length} ${abertos.length === 1 ? "toque estava" : "toques estavam"} programado(s) para este dia.`) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 16
+    }
+  }, porSlot.filter(b => b.itens.length > 0).map(b => /*#__PURE__*/React.createElement("div", {
+    key: b.slot
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 9,
+      marginBottom: 9
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "fr",
+    style: {
+      fontSize: 14,
+      fontWeight: 700
+    }
+  }, rotSlot(b.slot)), /*#__PURE__*/React.createElement(Tag, {
+    cor: C.muted
+  }, b.itens.length)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 8
+    }
+  }, b.itens.map((r, i) => /*#__PURE__*/React.createElement(LinhaRegistro, {
+    key: r.clienteId + "|" + r.slot + "|" + i,
+    r: r,
+    onAbrir: id => ctx.irParaCliente(id)
+  }))))), foraDaGrade.length > 0 && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      marginBottom: 9
+    }
+  }, "Fora dos três horários"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 8
+    }
+  }, foraDaGrade.map((r, i) => /*#__PURE__*/React.createElement(LinhaRegistro, {
+    key: "fora" + i,
+    r: r,
+    onAbrir: id => ctx.irParaCliente(id)
+  }))))), abertos.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 18,
+      paddingTop: 14,
+      borderTop: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 14,
+      fontWeight: 700,
+      marginBottom: 4
+    }
+  }, "Toques de ", fmtBR(dia), " sem registro (", abertos.length, ")"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 10
+    }
+  }, "Estavam na fila do dia e ninguém relatou. É o buraco que o relatório precisa mostrar."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, abertos.map((a, i) => /*#__PURE__*/React.createElement("button", {
+    key: a.clienteId + "|" + a.slot + "|" + i,
+    onClick: () => ctx.irParaCliente(a.clienteId),
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 7,
+      cursor: "pointer",
+      background: "transparent",
+      font: "inherit",
+      fontSize: 12.5,
+      border: `1px solid ${C.lineSoft}`,
+      borderRadius: 9,
+      padding: "6px 10px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted,
+      fontVariantNumeric: "tabular-nums"
+    }
+  }, a.slot.replace(":", "h")), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 600
+    }
+  }, a.cliente), a.dia && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.muted
+    }
+  }, "D", a.dia))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 9,
+      flexWrap: "wrap",
+      marginTop: 18,
+      paddingTop: 14,
+      borderTop: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: imprimir,
+    disabled: regs.length === 0
+  }, "Imprimir / PDF"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    size: "sm",
+    onClick: baixarCSV,
+    disabled: regs.length === 0
+  }, "Baixar CSV")), aviso && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12.5,
+      color: C.late,
+      marginTop: 10
+    }
+  }, aviso));
+}
 function Relatorios({
   ctx
 }) {
@@ -6455,14 +7146,79 @@ function Relatorios({
     if (periodo === "todos") return ["1900-01-01", hoje];
     return [addDays(hoje, -Number(periodo)), hoje];
   }, [periodo, de, ate]);
-  const base = useMemo(() => {
-    let l = clientes.itens.filter(c => {
-      const d = (c.criadoEm || "").slice(0, 10);
-      return d >= ini && d <= fim;
+
+  /* Escopo respeita o papel do usuário mas ignora o período: os blocos de
+     "cadastros recentes" têm janela própria e precisam enxergar tudo. */
+  const escopo = useMemo(() => P.relatorios === "proprios" ? clientes.itens.filter(c => c.responsavel === perfil.uid) : clientes.itens, [clientes.itens, P.relatorios, perfil.uid]);
+  const base = useMemo(() => escopo.filter(c => {
+    const d = dataDeCadastro(c);
+    return d >= ini && d <= fim;
+  }), [escopo, ini, fim]);
+
+  /* ---- cadastros recentes: janela independente do filtro de período ---- */
+  const [janela, setJanela] = useState("15");
+  const [quantos, setQuantos] = useState("10");
+  const recentes = useMemo(() => {
+    const dias = Number(janela);
+    const hoje = todayISO();
+    const de1 = addDays(hoje, -(dias - 1));
+    const de0 = addDays(hoje, -(dias * 2 - 1));
+    const lista = escopo.filter(c => {
+      const d = dataDeCadastro(c);
+      return d >= de1 && d <= hoje;
     });
-    if (P.relatorios === "proprios") l = l.filter(c => c.responsavel === perfil.uid);
-    return l;
-  }, [clientes.itens, ini, fim, P.relatorios, perfil.uid]);
+    const antes = escopo.filter(c => {
+      const d = dataDeCadastro(c);
+      return d >= de0 && d < de1;
+    });
+    const porDia = [];
+    for (let i = dias - 1; i >= 0; i--) {
+      const d = addDays(hoje, -i);
+      const doDia = lista.filter(c => dataDeCadastro(c) === d);
+      porDia.push({
+        data: d,
+        total: doDia.length,
+        importados: doDia.filter(c => c.importado).length
+      });
+    }
+    const uteis = porDia.filter(d => ehDiaUtil(d.data));
+    const emUteis = uteis.reduce((s, d) => s + d.total, 0);
+    return {
+      dias,
+      de: de1,
+      ate: hoje,
+      lista,
+      porDia,
+      total: lista.length,
+      antes: antes.length,
+      /* sem base anterior não existe variação — mostrar 100% seria mentira */
+      varia: antes.length ? Math.round((lista.length - antes.length) / antes.length * 100) : null,
+      pico: Math.max(1, ...porDia.map(d => d.total)),
+      importados: lista.filter(c => c.importado).length,
+      mediaUtil: uteis.length ? emUteis / uteis.length : 0
+    };
+  }, [escopo, janela]);
+  const contarPor = (arr, chave) => {
+    const m = {};
+    arr.forEach(c => {
+      const k = chave(c);
+      m[k] = (m[k] || 0) + 1;
+    });
+    return Object.entries(m).map(([k, n]) => ({
+      k,
+      n
+    })).sort((a, b) => b.n - a.n);
+  };
+  const composicao = useMemo(() => ({
+    origem: contarPor(recentes.lista, c => rotulo(c.origem, c.origemOutro)),
+    tema: contarPor(recentes.lista, c => c.tema || "Sem tema")
+  }), [recentes.lista]);
+  const ultimos = useMemo(() => [...escopo].sort((a, b) => {
+    const da = dataDeCadastro(a),
+      db = dataDeCadastro(b);
+    if (da !== db) return db.localeCompare(da);
+    return String(b.criadoEm || "").localeCompare(String(a.criadoEm || ""));
+  }).slice(0, Number(quantos)), [escopo, quantos]);
   const ganhos = base.filter(c => c.desfecho === "ganho");
   const perdidos = base.filter(c => c.desfecho === "perdido");
   const emAberto = base.filter(c => !c.desfecho);
@@ -6596,7 +7352,7 @@ function Relatorios({
 
   /* tempo médio até o ganho */
   const tempoMedio = useMemo(() => {
-    const dias = ganhos.filter(c => c.criadoEm && c.desfechoEm).map(c => diffDays(c.desfechoEm.slice(0, 10), c.criadoEm.slice(0, 10))).filter(d => d >= 0);
+    const dias = ganhos.filter(c => dataDeCadastro(c) && c.desfechoEm).map(c => diffDays(c.desfechoEm.slice(0, 10), dataDeCadastro(c))).filter(d => d >= 0);
     if (!dias.length) return null;
     return Math.round(dias.reduce((a, b) => a + b, 0) / dias.length);
   }, [base]);
@@ -6663,7 +7419,279 @@ function Relatorios({
       color: C.muted,
       marginBottom: 20
     }
-  }, base.length, " ", base.length === 1 ? "lead cadastrado" : "leads cadastrados", " entre ", fmtBR(ini), " e ", fmtBR(fim), P.relatorios === "proprios" ? " · apenas os seus" : ""), base.length === 0 ? /*#__PURE__*/React.createElement(Vazio, {
+  }, base.length, " ", base.length === 1 ? "lead cadastrado" : "leads cadastrados", " entre ", fmtBR(ini), " e ", fmtBR(fim), P.relatorios === "proprios" ? " · apenas os seus" : ""), /*#__PURE__*/React.createElement(RelatorioLigacoes, {
+    ctx: ctx,
+    escopo: escopo
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit,minmax(330px,1fr))",
+      gap: 16,
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20,
+      gridColumn: "1 / -1"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+      marginBottom: 3
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginRight: "auto"
+    }
+  }, "Novos cadastros"), /*#__PURE__*/React.createElement(Segmento, {
+    valor: janela,
+    onEscolher: setJanela,
+    opcoes: [["7", "7 dias"], ["15", "15 dias"], ["30", "30 dias"]]
+  })), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "Fichas criadas entre ", fmtBR(recentes.de), " e ", fmtBR(recentes.ate), ". Este bloco tem janela própria e não segue o filtro de período acima."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "baseline",
+      gap: 14,
+      flexWrap: "wrap",
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 38,
+      fontWeight: 700,
+      lineHeight: 1
+    }
+  }, recentes.total), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: C.muted,
+      lineHeight: 1.6
+    }
+  }, recentes.varia === null ? /*#__PURE__*/React.createElement(React.Fragment, null, "Sem cadastros nos ", recentes.dias, " dias anteriores — ainda não dá para comparar.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: recentes.varia > 0 ? C.ok : recentes.varia < 0 ? C.late : C.muted
+    }
+  }, recentes.varia > 0 ? "+" : "", recentes.varia, "%"), " ", "contra ", recentes.antes, " nos ", recentes.dias, " dias anteriores"), /*#__PURE__*/React.createElement("br", null), "Média de ", recentes.mediaUtil.toFixed(1).replace(".", ","), " por dia útil.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "flex-end",
+      gap: recentes.dias > 15 ? 3 : 6,
+      height: 96,
+      marginBottom: 6
+    }
+  }, recentes.porDia.map(d => {
+    const alt = Math.round(d.total / recentes.pico * 92);
+    const manual = d.total - d.importados;
+    return /*#__PURE__*/React.createElement("div", {
+      key: d.data,
+      title: `${fmtBR(d.data)} · ${d.total} cadastro(s)${d.importados ? ` (${d.importados} importado(s))` : ""}`,
+      style: {
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "flex-end",
+        height: "100%",
+        minWidth: 4
+      }
+    }, d.importados > 0 && /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: Math.round(d.importados / recentes.pico * 92),
+        background: C.brass,
+        borderRadius: "3px 3px 0 0"
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: Math.max(manual > 0 ? 2 : 0, Math.round(manual / recentes.pico * 92)),
+        background: ehDiaUtil(d.data) ? C.ink : C.muted,
+        borderRadius: d.importados > 0 ? 0 : "3px 3px 0 0"
+      }
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: 2,
+        background: alt === 0 ? C.lineSoft : "transparent"
+      }
+    }));
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 10.5,
+      color: C.muted
+    }
+  }, /*#__PURE__*/React.createElement("span", null, fmtBR(recentes.de)), /*#__PURE__*/React.createElement("span", null, "pico do período: ", recentes.pico), /*#__PURE__*/React.createElement("span", null, fmtBR(recentes.ate))), recentes.importados > 0 && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11.5,
+      color: C.muted,
+      marginTop: 12,
+      lineHeight: 1.6,
+      paddingTop: 12,
+      borderTop: `1px solid ${C.lineSoft}`
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-block",
+      width: 9,
+      height: 9,
+      borderRadius: 2,
+      background: C.brass,
+      marginRight: 6
+    }
+  }), recentes.importados, " de ", recentes.total, " vieram de planilha. Fichas importadas sem data de cadastro na origem entram no dia da importação — daí um pico isolado.")), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginBottom: 3
+    }
+  }, "De onde vieram os últimos ", recentes.dias, " dias"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "O total sozinho diz que cresceu; isto diz por onde."), composicao.origem.length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, "Nenhum cadastro nesta janela.") : composicao.origem.map(o => /*#__PURE__*/React.createElement(Barra, {
+    key: o.k,
+    rotulo: o.k,
+    valor: o.n,
+    total: recentes.total,
+    cor: C.ink
+  }))), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginBottom: 3
+    }
+  }, "Temas dos últimos ", recentes.dias, " dias"), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 16
+    }
+  }, "Assunto do que entrou na janela, para pegar mudança de demanda cedo."), composicao.tema.length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, "Nenhum cadastro nesta janela.") : composicao.tema.map(t => /*#__PURE__*/React.createElement(Barra, {
+    key: t.k,
+    rotulo: t.k,
+    valor: t.n,
+    total: recentes.total,
+    cor: TEMA_COR[t.k] || C.muted
+  }))), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      padding: 20,
+      gridColumn: "1 / -1"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+      marginBottom: 3
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "fr",
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      marginRight: "auto"
+    }
+  }, "Últimos cadastros"), /*#__PURE__*/React.createElement(Segmento, {
+    valor: quantos,
+    onEscolher: setQuantos,
+    opcoes: [["10", "10"], ["15", "15"], ["30", "30"]]
+  })), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 12,
+      color: C.muted,
+      marginBottom: 14
+    }
+  }, "As fichas mais recentes, na ordem de entrada. Clique para abrir."), ultimos.length === 0 ? /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: C.muted
+    }
+  }, "Nenhum cliente cadastrado ainda.") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 8
+    }
+  }, ultimos.map(c => {
+    const s = situacaoCadencia(c);
+    return /*#__PURE__*/React.createElement("button", {
+      key: c.id,
+      onClick: () => ctx.irParaCliente(c.id),
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        flexWrap: "wrap",
+        textAlign: "left",
+        width: "100%",
+        cursor: "pointer",
+        background: "transparent",
+        padding: "10px 12px",
+        borderRadius: 10,
+        border: `1px solid ${C.lineSoft}`,
+        font: "inherit"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11.5,
+        color: C.muted,
+        whiteSpace: "nowrap",
+        minWidth: 74,
+        fontVariantNumeric: "tabular-nums"
+      }
+    }, fmtBR(dataDeCadastro(c))), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 13.5,
+        fontWeight: 600,
+        marginRight: "auto"
+      }
+    }, c.nome, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "block",
+        fontSize: 11.5,
+        fontWeight: 400,
+        color: C.muted,
+        marginTop: 2
+      }
+    }, rotulo(c.origem, c.origemOutro), c.tema ? ` · ${rotuloTema(c)}` : "", c.area ? ` · ${c.area}` : "", c.importado ? " · da planilha" : "")), /*#__PURE__*/React.createElement(Tag, {
+      cor: ESTAGIO_COR[c.estagio || "Novo lead"] || C.muted
+    }, c.estagio || "Novo lead"), /*#__PURE__*/React.createElement(Tag, {
+      cor: s.cor
+    }, s.texto));
+  })))), base.length === 0 ? /*#__PURE__*/React.createElement(Vazio, {
     titulo: "Sem dados neste período",
     texto: "Nenhum lead foi cadastrado no intervalo selecionado. Experimente ampliar o período."
   }) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
@@ -7462,6 +8490,18 @@ function EditarUsuario({
 
 /* --------------------------- montagem ---------------------------- */
 function seedDemo() {
+  /* Time do escritório fictício, para o relatório diário de ligações
+     mostrar quem falou com quem. */
+  const equipeDemo = [{
+    uid: "u2",
+    nome: "Ana Paula Ribeiro"
+  }, {
+    uid: "u1",
+    nome: "Dra. Helena Sampaio"
+  }, {
+    uid: "u3",
+    nome: "Dr. Rafael Toledo"
+  }];
   const d = n => {
     const x = new Date();
     x.setDate(x.getDate() + n);
@@ -7483,6 +8523,9 @@ function seedDemo() {
     const quando = parseISO(f.data);
     const [hh, mm] = slotDe(f).split(":");
     quando.setHours(Number(hh), Number(mm) + 4 + i % 9, 0, 0);
+    /* Quem registrou o contato. Sem isto o relatório do dia sairia
+       inteiro como "autor não registrado" na demonstração. */
+    const autor = equipeDemo[(i + Number(inicio.slice(-2))) % equipeDemo.length];
     return {
       ...f,
       feito: true,
@@ -7490,7 +8533,9 @@ function seedDemo() {
       canal,
       canalOutro: "",
       semResposta,
-      nota
+      nota,
+      porQuem: autor.nome,
+      porUid: autor.uid
     };
   });
 
