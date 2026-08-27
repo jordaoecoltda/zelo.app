@@ -378,23 +378,6 @@ const gerarFollowups = (inicioISO) => {
   return out;
 };
 
-/* Migração pontual: reduz a cadência de 3 para 2 toques por dia SEM apagar
-   histórico. Toques já feitos ficam intactos. Nos ainda não feitos: o de
-   17:00 é removido e o de 13:00 vira 14:00. Idempotente — rodar de novo não
-   muda quem já foi migrado. */
-const migrarCadencia2Toques = (fups) => {
-  if (!Array.isArray(fups)) return { mudou:false, novos:fups };
-  let mudou = false;
-  const novos = [];
-  fups.forEach(f => {
-    if (f.feito)            { novos.push(f); return; }              // histórico, não toca
-    if (f.slot === "17:00") { mudou = true; return; }              // 3º toque some
-    if (f.slot === "13:00") { novos.push({ ...f, slot:"14:00" }); mudou = true; return; }
-    novos.push(f);
-  });
-  return { mudou, novos };
-};
-
 /* Cadência antiga: seis contatos sem horário (D1, D3, D5, D7, D15, D28). */
 const ehCadenciaAntiga = (fups) =>
   Array.isArray(fups) && fups.length > 0 && fups.every(f => !f.slot);
@@ -1052,127 +1035,6 @@ function Workspace({ user, perfil }) {
 }
 
 /* --------------------------- PAINEL ------------------------------ */
-/* ------------------------------------------------------------------ *
- *  MIGRAÇÃO PONTUAL: 3 → 2 toques por dia (uso único, só master)
- *  Some depois que não houver mais nada a migrar. Pode ser removido
- *  do código assim que a migração for concluída em produção.
- * ------------------------------------------------------------------ */
-function MigracaoCadencia({ ctx }) {
-  const { clientes, perfil } = ctx;
-  const [fase, setFase] = useState("idle");   // idle | confirmar | rodando | feito
-  const [feitosN, setFeitosN] = useState(0);
-  const [erro, setErro] = useState("");
-  const [bkp, setBkp] = useState("idle");     // idle | baixando | ok | erro
-
-  /* Backup completo: lê as coleções do banco e baixa um único .json. Só leitura. */
-  const baixarBackup = async () => {
-    setBkp("baixando");
-    try {
-      const dados = {};
-      for (const p of ["clientes", "processos", "eventos", "usuarios"]) {
-        const snap = await db.ref(p).get();
-        dados[p] = snap.val() || {};
-      }
-      const blob = new Blob([JSON.stringify(dados, null, 2)], { type:"application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = `zelo-backup-${todayISO()}.json`;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setBkp("ok");
-    } catch (e) { setBkp("erro"); }
-  };
-
-  const botaoBackup = (
-    <div style={{ marginBottom:12 }}>
-      <Btn kind="ghost" size="sm" onClick={baixarBackup} disabled={bkp === "baixando"}>
-        {bkp === "baixando" ? "Baixando backup…" : "1. Baixar backup (JSON)"}
-      </Btn>
-      {bkp === "ok"   && <span style={{ fontSize:12, color:C.ok, marginLeft:8 }}>Backup baixado ✓</span>}
-      {bkp === "erro" && <span style={{ fontSize:12, color:C.late, marginLeft:8 }}>Falhou — use o Firebase Console.</span>}
-    </div>
-  );
-
-  const afetados = useMemo(
-    () => clientes.itens.filter(c => migrarCadencia2Toques(c.followups).mudou),
-    [clientes.itens]
-  );
-
-  if (perfil.papel !== "master") return null;
-  /* Nada a migrar e nunca rodou nesta sessão: não polui o painel. */
-  if (afetados.length === 0 && fase !== "feito") return null;
-
-  const rodar = async () => {
-    setFase("rodando"); setErro(""); let n = 0;
-    try {
-      for (const c of afetados) {
-        const { mudou, novos } = migrarCadencia2Toques(c.followups);
-        if (mudou) { await clientes.atualizar(c.id, { followups: novos }); n++; }
-      }
-      setFeitosN(n); setFase("feito");
-    } catch (e) {
-      setErro(`Parou no meio (${n} já migrados). Pode clicar de novo — quem já foi não muda outra vez. Detalhe: ${e && e.message ? e.message : e}`);
-      setFeitosN(n); setFase("feito");
-    }
-  };
-
-  return (
-    <Card style={{ padding:18, marginBottom:20, border:`1px solid ${C.brassSoft}`,
-                   background:"#FBF8F1" }}>
-      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
-        <Icon.bell size={16} color={C.brass} />
-        <div className="fr" style={{ fontSize:15, fontWeight:700 }}>
-          Migrar cadências para 2 toques por dia
-        </div>
-        <Tag cor={C.muted}>uso único</Tag>
-      </div>
-
-      {fase === "feito" ? (
-        <>
-          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6 }}>
-            {feitosN === 0
-              ? "Nada a migrar — as cadências já estão em 2 toques por dia."
-              : `Pronto: ${feitosN} ${feitosN === 1 ? "lead teve a cadência ajustada" : "leads tiveram a cadência ajustada"}. Os toques de 17h ainda não feitos foram removidos e os de 13h viraram 14h. Nada do que já estava registrado foi alterado.`}
-          </p>
-          {erro && <p style={{ fontSize:12.5, color:C.late, marginTop:8 }}>{erro}</p>}
-          {afetados.length > 0 && (
-            <Btn kind="ghost" size="sm" style={{ marginTop:10 }}
-                 onClick={() => setFase("confirmar")}>Ainda há {afetados.length} para migrar — rodar de novo</Btn>
-          )}
-        </>
-      ) : fase === "rodando" ? (
-        <p style={{ fontSize:13, color:C.inkSoft }}>Migrando… não feche a página.</p>
-      ) : fase === "confirmar" ? (
-        <>
-          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6, marginBottom:6 }}>
-            Vou ajustar <b>{afetados.length}</b> {afetados.length === 1 ? "lead" : "leads"} em andamento:
-            nos dias que ainda faltam, o 3º toque (17h) é removido e o de 13h vira 14h.
-            O dia da cadência (D1…D8) e tudo que já foi registrado ficam como estão.
-          </p>
-          <p style={{ fontSize:12, color:C.late, marginBottom:12 }}>
-            Baixe o backup antes, por garantia. A ação grava direto no banco.
-          </p>
-          {botaoBackup}
-          <div style={{ display:"flex", gap:8 }}>
-            <Btn kind="brass" size="sm" onClick={rodar}>2. Confirmar e migrar</Btn>
-            <Btn kind="ghost" size="sm" onClick={() => setFase("idle")}>Cancelar</Btn>
-          </div>
-        </>
-      ) : (
-        <>
-          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6, marginBottom:12 }}>
-            {afetados.length} {afetados.length === 1 ? "lead ainda tem" : "leads ainda têm"} a
-            grade antiga de 3 toques (08h/13h/17h) nos dias que faltam. Clique para passar para
-            2 toques (08h/14h), preservando o histórico.
-          </p>
-          {botaoBackup}
-          <Btn kind="brass" size="sm" onClick={() => setFase("confirmar")}>2. Migrar cadências</Btn>
-        </>
-      )}
-    </Card>
-  );
-}
-
 function Painel({ ctx }) {
   const { clientes, processos, eventos, perfil, P, irPara, pendencias } = ctx;
   const hoje = todayISO();
@@ -1210,7 +1072,6 @@ function Painel({ ctx }) {
 
   return (
     <div className="rise">
-      <MigracaoCadencia ctx={ctx} />
       <h1 className="fr" style={{ fontSize:26, fontWeight:700, marginBottom:4 }}>
         {saudacao()}, {(perfil.nome || "").split(" ")[0] || "bem-vindo"}
       </h1>
