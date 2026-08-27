@@ -137,6 +137,8 @@ const C = {
 /* --------------------------- constantes -------------------------- */
 const AREAS = ["Cível","Trabalhista","Criminal","Família","Previdenciário","Consumidor","Tributário","Empresarial","Outro"];
 const ORIGENS = ["Indicação","Instagram","Google","Site","WhatsApp","Parceiro/advogado","Cliente antigo","Anúncio pago","Telefone/balcão","Outro"];
+/* Classificação interna do lead — separada do canal acima. "Outros" abre campo livre. */
+const ORIGENS_INTERNAS = ["Start","E3","Indicação","Outros"];
 const ESTAGIOS = ["Novo lead","Consulta agendada","Proposta enviada","Contrato fechado","Cliente ativo","Arquivado"];
 const TEMAS = ["Negativas","TEA","Reajuste Abusivo","Outros"];
 const TEMA_COR = {
@@ -173,12 +175,12 @@ const MOTIVOS_GANHO = [
 ];
 
 /* ---------------------- cadência de contato ----------------------
-   D1 a D8 em dias seguidos. Cada dia tem três toques de horário fixo:
-   08h, 13h e 17h. São 24 contatos por ciclo e cada um exige o relato
+   D1 a D8 em dias seguidos. Cada dia tem dois toques de horário fixo:
+   08h e 14h. São 16 contatos por ciclo e cada um exige o relato
    do que foi conversado ou enviado.                                 */
 const CADENCIA_DIAS = 8;
-const SLOTS = ["08:00", "13:00", "17:00"];
-const SLOT_NOME = { "08:00":"Manhã", "13:00":"Tarde", "17:00":"Fim do dia" };
+const SLOTS = ["08:00", "14:00"];
+const SLOT_NOME = { "08:00":"Manhã", "14:00":"Tarde" };
 
 /* true  = D1..D8 pulam sábado, domingo e feriado nacional (escritório fechado)
    false = D1..D8 em dias corridos, inclusive fim de semana                  */
@@ -374,6 +376,23 @@ const gerarFollowups = (inicioISO) => {
     }));
   });
   return out;
+};
+
+/* Migração pontual: reduz a cadência de 3 para 2 toques por dia SEM apagar
+   histórico. Toques já feitos ficam intactos. Nos ainda não feitos: o de
+   17:00 é removido e o de 13:00 vira 14:00. Idempotente — rodar de novo não
+   muda quem já foi migrado. */
+const migrarCadencia2Toques = (fups) => {
+  if (!Array.isArray(fups)) return { mudou:false, novos:fups };
+  let mudou = false;
+  const novos = [];
+  fups.forEach(f => {
+    if (f.feito)            { novos.push(f); return; }              // histórico, não toca
+    if (f.slot === "17:00") { mudou = true; return; }              // 3º toque some
+    if (f.slot === "13:00") { novos.push({ ...f, slot:"14:00" }); mudou = true; return; }
+    novos.push(f);
+  });
+  return { mudou, novos };
 };
 
 /* Cadência antiga: seis contatos sem horário (D1, D3, D5, D7, D15, D28). */
@@ -1033,6 +1052,127 @@ function Workspace({ user, perfil }) {
 }
 
 /* --------------------------- PAINEL ------------------------------ */
+/* ------------------------------------------------------------------ *
+ *  MIGRAÇÃO PONTUAL: 3 → 2 toques por dia (uso único, só master)
+ *  Some depois que não houver mais nada a migrar. Pode ser removido
+ *  do código assim que a migração for concluída em produção.
+ * ------------------------------------------------------------------ */
+function MigracaoCadencia({ ctx }) {
+  const { clientes, perfil } = ctx;
+  const [fase, setFase] = useState("idle");   // idle | confirmar | rodando | feito
+  const [feitosN, setFeitosN] = useState(0);
+  const [erro, setErro] = useState("");
+  const [bkp, setBkp] = useState("idle");     // idle | baixando | ok | erro
+
+  /* Backup completo: lê as coleções do banco e baixa um único .json. Só leitura. */
+  const baixarBackup = async () => {
+    setBkp("baixando");
+    try {
+      const dados = {};
+      for (const p of ["clientes", "processos", "eventos", "usuarios"]) {
+        const snap = await db.ref(p).get();
+        dados[p] = snap.val() || {};
+      }
+      const blob = new Blob([JSON.stringify(dados, null, 2)], { type:"application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `zelo-backup-${todayISO()}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setBkp("ok");
+    } catch (e) { setBkp("erro"); }
+  };
+
+  const botaoBackup = (
+    <div style={{ marginBottom:12 }}>
+      <Btn kind="ghost" size="sm" onClick={baixarBackup} disabled={bkp === "baixando"}>
+        {bkp === "baixando" ? "Baixando backup…" : "1. Baixar backup (JSON)"}
+      </Btn>
+      {bkp === "ok"   && <span style={{ fontSize:12, color:C.ok, marginLeft:8 }}>Backup baixado ✓</span>}
+      {bkp === "erro" && <span style={{ fontSize:12, color:C.late, marginLeft:8 }}>Falhou — use o Firebase Console.</span>}
+    </div>
+  );
+
+  const afetados = useMemo(
+    () => clientes.itens.filter(c => migrarCadencia2Toques(c.followups).mudou),
+    [clientes.itens]
+  );
+
+  if (perfil.papel !== "master") return null;
+  /* Nada a migrar e nunca rodou nesta sessão: não polui o painel. */
+  if (afetados.length === 0 && fase !== "feito") return null;
+
+  const rodar = async () => {
+    setFase("rodando"); setErro(""); let n = 0;
+    try {
+      for (const c of afetados) {
+        const { mudou, novos } = migrarCadencia2Toques(c.followups);
+        if (mudou) { await clientes.atualizar(c.id, { followups: novos }); n++; }
+      }
+      setFeitosN(n); setFase("feito");
+    } catch (e) {
+      setErro(`Parou no meio (${n} já migrados). Pode clicar de novo — quem já foi não muda outra vez. Detalhe: ${e && e.message ? e.message : e}`);
+      setFeitosN(n); setFase("feito");
+    }
+  };
+
+  return (
+    <Card style={{ padding:18, marginBottom:20, border:`1px solid ${C.brassSoft}`,
+                   background:"#FBF8F1" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+        <Icon.bell size={16} color={C.brass} />
+        <div className="fr" style={{ fontSize:15, fontWeight:700 }}>
+          Migrar cadências para 2 toques por dia
+        </div>
+        <Tag cor={C.muted}>uso único</Tag>
+      </div>
+
+      {fase === "feito" ? (
+        <>
+          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6 }}>
+            {feitosN === 0
+              ? "Nada a migrar — as cadências já estão em 2 toques por dia."
+              : `Pronto: ${feitosN} ${feitosN === 1 ? "lead teve a cadência ajustada" : "leads tiveram a cadência ajustada"}. Os toques de 17h ainda não feitos foram removidos e os de 13h viraram 14h. Nada do que já estava registrado foi alterado.`}
+          </p>
+          {erro && <p style={{ fontSize:12.5, color:C.late, marginTop:8 }}>{erro}</p>}
+          {afetados.length > 0 && (
+            <Btn kind="ghost" size="sm" style={{ marginTop:10 }}
+                 onClick={() => setFase("confirmar")}>Ainda há {afetados.length} para migrar — rodar de novo</Btn>
+          )}
+        </>
+      ) : fase === "rodando" ? (
+        <p style={{ fontSize:13, color:C.inkSoft }}>Migrando… não feche a página.</p>
+      ) : fase === "confirmar" ? (
+        <>
+          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6, marginBottom:6 }}>
+            Vou ajustar <b>{afetados.length}</b> {afetados.length === 1 ? "lead" : "leads"} em andamento:
+            nos dias que ainda faltam, o 3º toque (17h) é removido e o de 13h vira 14h.
+            O dia da cadência (D1…D8) e tudo que já foi registrado ficam como estão.
+          </p>
+          <p style={{ fontSize:12, color:C.late, marginBottom:12 }}>
+            Baixe o backup antes, por garantia. A ação grava direto no banco.
+          </p>
+          {botaoBackup}
+          <div style={{ display:"flex", gap:8 }}>
+            <Btn kind="brass" size="sm" onClick={rodar}>2. Confirmar e migrar</Btn>
+            <Btn kind="ghost" size="sm" onClick={() => setFase("idle")}>Cancelar</Btn>
+          </div>
+        </>
+      ) : (
+        <>
+          <p style={{ fontSize:13, color:C.inkSoft, lineHeight:1.6, marginBottom:12 }}>
+            {afetados.length} {afetados.length === 1 ? "lead ainda tem" : "leads ainda têm"} a
+            grade antiga de 3 toques (08h/13h/17h) nos dias que faltam. Clique para passar para
+            2 toques (08h/14h), preservando o histórico.
+          </p>
+          {botaoBackup}
+          <Btn kind="brass" size="sm" onClick={() => setFase("confirmar")}>2. Migrar cadências</Btn>
+        </>
+      )}
+    </Card>
+  );
+}
+
 function Painel({ ctx }) {
   const { clientes, processos, eventos, perfil, P, irPara, pendencias } = ctx;
   const hoje = todayISO();
@@ -1070,6 +1210,7 @@ function Painel({ ctx }) {
 
   return (
     <div className="rise">
+      <MigracaoCadencia ctx={ctx} />
       <h1 className="fr" style={{ fontSize:26, fontWeight:700, marginBottom:4 }}>
         {saudacao()}, {(perfil.nome || "").split(" ")[0] || "bem-vindo"}
       </h1>
@@ -1324,6 +1465,7 @@ function LinhaCliente({ c, onAbrir }) {
         <div style={{ fontSize:12, color:C.muted, marginTop:3 }}>
           {c.telefone || c.email || "sem contato"} · {c.area || "área não definida"} ·
           {" "}origem: {rotulo(c.origem, c.origemOutro)}
+          {c.origemInterna ? ` · interna: ${rotulo(c.origemInterna, c.origemInternaOutro, "Outros")}` : ""}
         </div>
       </div>
 
@@ -1435,7 +1577,7 @@ function ClienteForm({ ctx, cliente, onFechar }) {
   const ed = !!cliente;
   const [f, setF] = useState(() => cliente ? { ...cliente } : {
     nome:"", telefone:"", email:"", cpf:"", area:"", tema:"", temaOutro:"",
-    origem:"", origemOutro:"",
+    origem:"", origemOutro:"", origemInterna:"", origemInternaOutro:"",
     estagio:"Novo lead", valorProposta:"", observacoes:"", inicioCadencia: todayISO()
   });
   const [erro, setErro] = useState("");
@@ -1447,6 +1589,10 @@ function ClienteForm({ ctx, cliente, onFechar }) {
     if (f.origem === "Outro" && !String(f.origemOutro || "").trim()) {
       setErro("Descreva a origem no campo livre."); return;
     }
+    /* Origem interna é opcional; só exige o texto livre quando a escolha é "Outros". */
+    if (f.origemInterna === "Outros" && !String(f.origemInternaOutro || "").trim()) {
+      setErro("Descreva a origem interna no campo livre."); return;
+    }
     /* O tema é opcional, mas se a escolha for "Outros" o texto passa a ser
        obrigatório — senão o relatório enche de "Outros" sem significado. */
     if (f.tema === "Outros" && !String(f.temaOutro || "").trim()) {
@@ -1457,6 +1603,8 @@ function ClienteForm({ ctx, cliente, onFechar }) {
       area: f.area || "",
       tema: f.tema || "", temaOutro: f.tema === "Outros" ? String(f.temaOutro || "").trim() : "",
       origem: f.origem, origemOutro: f.origem === "Outro" ? f.origemOutro.trim() : "",
+      origemInterna: f.origemInterna || "",
+      origemInternaOutro: f.origemInterna === "Outros" ? String(f.origemInternaOutro || "").trim() : "",
       estagio: f.estagio || "Novo lead",
       valorProposta: f.valorProposta ? Number(String(f.valorProposta).replace(/\D/g, "")) : "",
       observacoes: f.observacoes || ""
@@ -1530,12 +1678,20 @@ function ClienteForm({ ctx, cliente, onFechar }) {
             placeholder="Ex.: indicação do contador"
             onChange={(v, o) => setF(p => ({ ...p, origem:v, origemOutro:o }))} />
 
-          {!ed && (
+          <SelectComOutro label="Origem interna" opcoes={ORIGENS_INTERNAS} chaveOutro="Outros"
+            hint="Classificação interna do lead (Start, E3, indicação…). Opcional."
+            valor={f.origemInterna} outro={f.origemInternaOutro}
+            placeholder="Descreva a origem interna"
+            onChange={(v, o) => setF(p => ({ ...p, origemInterna:v, origemInternaOutro:o }))} />
+        </div>
+
+        {!ed && (
+          <div className="grid2">
             <Campo label="Início da cadência" hint={`${CADENCIA_RESUMO}. D1 é o primeiro dia útil depois desta data.`}>
               <Inp type="date" value={f.inicioCadencia} onChange={e => set("inicioCadencia", e.target.value)} />
             </Campo>
-          )}
-        </div>
+          </div>
+        )}
 
         <Campo label="Observações">
           <Txt value={f.observacoes} onChange={e => set("observacoes", e.target.value)}
@@ -2051,7 +2207,7 @@ function ImportarClientes({ ctx, onFechar }) {
           )}
 
           <Campo label="Cadência de contato para os importados"
-                 hint="Cada dia tem três toques. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato.">
+                 hint="Cada dia tem dois toques. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato.">
             <Sel value={modoCadencia} onChange={e => setModoCadencia(e.target.value)}>
               <option value="nao">Não iniciar agora — cadastrar só as fichas</option>
               <option value="hoje">Começar hoje, para todos</option>
@@ -2252,7 +2408,7 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
   return (
     <>
       <Modal titulo={c.nome} largura={920}
-             sub={`${c.area || "Área não definida"}${c.tema ? ` · ${rotuloTema(c)}` : ""} · origem: ${rotulo(c.origem, c.origemOutro)}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`}
+             sub={`${c.area || "Área não definida"}${c.tema ? ` · ${rotuloTema(c)}` : ""} · origem: ${rotulo(c.origem, c.origemOutro)}${c.origemInterna ? ` · interna: ${rotulo(c.origemInterna, c.origemInternaOutro, "Outros")}` : ""}${c.ciclo > 1 ? ` · ${c.ciclo}º ciclo` : ""}`}
              onFechar={onFechar}
              rodape={<>
                {perfil.papel === "master" && (
@@ -3183,7 +3339,7 @@ function Followup({ ctx }) {
         {pendente === 0
           ? `Nenhum contato vencido às ${agora.replace(":", "h")}. A cadência está em dia.`
           : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} agora, contando os atrasados.`}
-        {" "}Cada cliente tem três toques por dia — {SLOTS.map(h => h.replace(":", "h")).join(", ")} — e cada um
+        {" "}Cada cliente tem dois toques por dia — {SLOTS.map(h => h.replace(":", "h")).join(", ")} — e cada um
         pede o relato do que foi conversado ou enviado.
       </p>
       {avisos && (
@@ -3245,7 +3401,7 @@ function Followup({ ctx }) {
               {emDiaNaoUtil} {emDiaNaoUtil === 1 ? "contato caiu" : "contatos caíram"} em fim de semana ou feriado
             </div>
             <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55 }}>
-              O ajuste move o dia inteiro para o próximo dia útil, com os três toques juntos,
+              O ajuste move o dia inteiro para o próximo dia útil, com os dois toques juntos,
               sem mexer no que já foi registrado.
             </div>
           </div>
@@ -4054,7 +4210,7 @@ ${regs.length ? `<table><thead><tr><th>Hora</th><th>Cliente</th><th>Toque</th><t
           {foraDaGrade.length > 0 && (
             <div>
               <div className="fr" style={{ fontSize:14, fontWeight:700, marginBottom:9 }}>
-                Fora dos três horários
+                Fora dos horários fixos
               </div>
               <div style={{ display:"grid", gap:8 }}>
                 {foraDaGrade.map((r, i) => (
@@ -4208,6 +4364,18 @@ function Relatorios({ ctx }) {
       origem: k, ...v,
       taxa: (v.ganho + v.perdido) ? Math.round((v.ganho / (v.ganho + v.perdido)) * 100) : null
     })).sort((a,b) => b.total - a.total);
+  }, [base]);
+
+  /* origem interna: volume (só conta fichas que têm o campo preenchido) */
+  const porOrigemInterna = useMemo(() => {
+    const m = {};
+    base.forEach(c => {
+      if (!c.origemInterna) return;
+      const k = rotulo(c.origemInterna, c.origemInternaOutro, "Outros");
+      m[k] = (m[k] || 0) + 1;
+    });
+    return Object.entries(m).map(([k, n]) => ({ origem:k, total:n }))
+      .sort((a,b) => b.total - a.total);
   }, [base]);
 
   /* tema: volume, conversão e o que foi digitado à mão */
@@ -4528,6 +4696,19 @@ function Relatorios({ ctx }) {
                      extra={`${o.ganho} fechado${o.ganho === 1 ? "" : "s"} de ${o.ganho + o.perdido}`} />
             ))}
           </Card>
+
+          {/* volume por origem interna */}
+          {porOrigemInterna.length > 0 && (
+          <Card style={{ padding:20 }}>
+            <div className="fr" style={{ fontSize:17, fontWeight:700, marginBottom:3 }}>Origem interna</div>
+            <p style={{ fontSize:12, color:C.muted, marginBottom:16 }}>
+              Classificação interna dos leads no período (Start, E3, indicação…).
+            </p>
+            {porOrigemInterna.map(o => (
+              <Barra key={o.origem} rotulo={o.origem} valor={o.total} total={base.length} cor={C.brass} />
+            ))}
+          </Card>
+          )}
 
           {/* volume por tema */}
           <Card style={{ padding:20 }}>
