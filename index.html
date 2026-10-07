@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-08-14-a";
+const BUILD = "2026-10-07-a";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -401,9 +401,40 @@ const ajustarParaDiasUteis = (fups) => {
   return { lista, mudou };
 };
 
+/* ---- pausa do follow-up ----
+   Cliente pausado sai da fila, do painel, dos avisos e do relatório de toques
+   não relatados, mas a cadência continua guardada na ficha. Ao retomar, os
+   toques em aberto andam para frente o mesmo número de dias que a pausa
+   durou: o cliente volta do ponto em que parou, e não com uma pilha de
+   atrasados acumulados durante a pausa. */
+const PAUSA_COR = "#5E6E85";
+const estaPausado = (c) => !!(c && c.followupPausado && !c.desfecho);
+const diasDePausa = (c) =>
+  c && c.pausaEm ? Math.max(0, diffDays(todayISO(), diaLocal(c.pausaEm))) : 0;
+const CAMPOS_SEM_PAUSA = { followupPausado:false, pausaEm:null, pausaMotivo:"",
+                           pausaPorQuem:"", pausaPorUid:"" };
+const camposRetomada = (c, perfil) => {
+  const dias = diasDePausa(c);
+  const fups = Array.isArray(c.followups) ? c.followups : [];
+  let lista = fups;
+  if (dias > 0) {
+    lista = fups.map(f => f.feito ? f : { ...f, data: addDays(f.data, dias) });
+    lista = ajustarParaDiasUteis(lista).lista;
+  }
+  return {
+    ...CAMPOS_SEM_PAUSA,
+    followups: lista,
+    historicoPausas: [ ...(Array.isArray(c.historicoPausas) ? c.historicoPausas : []), {
+      inicio: c.pausaEm || null, fim: new Date().toISOString(),
+      motivo: c.pausaMotivo || "", pausadoPor: c.pausaPorQuem || "",
+      retomadoPor: (perfil && (perfil.nome || perfil.email)) || "", diasDeslocados: dias
+    }]
+  };
+};
+
 const contarNaoUteis = (clientes) => {
   let n = 0;
-  clientes.filter(c => !c.desfecho).forEach(c => {
+  clientes.filter(c => !c.desfecho && !c.followupPausado).forEach(c => {
     (Array.isArray(c.followups) ? c.followups : [])
       .forEach(f => { if (!f.feito && !ehDiaUtil(f.data)) n++; });
   });
@@ -1231,6 +1262,7 @@ function Clientes({ ctx }) {
     if (filtro === "abertos")  l = l.filter(c => !c.desfecho);
     if (filtro === "ganhos")   l = l.filter(c => c.desfecho === "ganho");
     if (filtro === "perdidos") l = l.filter(c => c.desfecho === "perdido");
+    if (filtro === "pausados") l = l.filter(estaPausado);
     if (filtroTema !== "todos") {
       l = l.filter(c => filtroTema === "sem" ? !c.tema : c.tema === filtroTema);
     }
@@ -1269,6 +1301,7 @@ function Clientes({ ctx }) {
           <option value="abertos">Em aberto</option>
           <option value="ganhos">Ganhos</option>
           <option value="perdidos">Perdidos</option>
+          <option value="pausados">Follow-up pausado</option>
           <option value="todos">Todos</option>
         </Sel>
         <Sel value={filtroTema} onChange={e => setFiltroTema(e.target.value)} style={{ maxWidth:200 }}>
@@ -1334,7 +1367,8 @@ function LinhaCliente({ c, onAbrir }) {
       {c.desfecho === "perdido" && <Tag cor={C.late} forte>Perdido</Tag>}
       {!c.desfecho && <Tag cor={ESTAGIO_COR[c.estagio] || C.muted}>{c.estagio || "Novo lead"}</Tag>}
 
-      {!c.desfecho && prox && (
+      {estaPausado(c) && <Tag cor={PAUSA_COR} forte>Follow-up pausado</Tag>}
+      {!c.desfecho && prox && !estaPausado(c) && (
         <Tag cor={statusCor(st)}>
           D{prox.dia} · {slotHora(prox)} · {st === "atrasado" ? `${Math.abs(diffDays(prox.data))}d atrás`
                         : st === "hoje" ? "hoje" : fmtBR(prox.data)}
@@ -2344,6 +2378,10 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
                {!antiga && ` · ${feitosN} de ${fups.length} registrados`}</>}
         </div>
 
+        {!semCadencia && !encerrado && (podeEditar || estaPausado(c)) && (
+          <PausaFollowup c={c} ctx={ctx} podeEditar={podeEditar} />
+        )}
+
         {semCadencia && !encerrado && podeEditar && (
           <Card style={{ padding:"14px 16px", marginBottom:14, background:"#9C7C3C0F",
                          borderColor:"#9C7C3C33" }}>
@@ -2414,7 +2452,7 @@ function ClienteDetalhe({ ctx, id, onFechar, onEditar }) {
           </div>
         )}
 
-        <div style={{ display:"grid", gap:10, marginBottom:20, opacity: encerrado ? .55 : 1 }}>
+        <div style={{ display:"grid", gap:10, marginBottom:20, opacity: (encerrado || estaPausado(c)) ? .55 : 1 }}>
           {diasVisiveis.map(g => {
             const abertosDoDia = g.itens.filter(x => !x.feito).length;
             return (
@@ -2714,6 +2752,7 @@ function DesfechoModal({ tipo, cliente, ctx, onFechar }) {
       desfechoNota: nota.trim(),
       desfechoEm: new Date().toISOString(),
       desfechoPor: perfil.uid,
+      ...CAMPOS_SEM_PAUSA,
       estagio: ganho ? "Contrato fechado" : "Arquivado",
       valorProposta: valor ? Number(String(valor).replace(/\D/g, "")) : cliente.valorProposta || ""
     });
@@ -2863,6 +2902,105 @@ function ExcluirClienteModal({ cliente, ctx, onFechar, onExcluido }) {
   );
 }
 
+/* ------------------- pausa do follow-up -------------------------- */
+/* Componente próprio para que o estado da caixa não some hooks na ficha
+   (ClienteDetalhe tem retorno antecipado e não pode ganhar hooks novos). */
+function PausaFollowup({ c, ctx, podeEditar }) {
+  const { clientes, perfil } = ctx;
+  const [marcando, setMarcando] = useState(false);
+  const [motivo, setMotivo] = useState("");
+  const [retomando, setRetomando] = useState(false);
+  const pausado = estaPausado(c);
+  const dias = diasDePausa(c);
+  const emAberto = (Array.isArray(c.followups) ? c.followups : []).filter(f => !f.feito).length;
+
+  const pausar = () => {
+    clientes.atualizar(c.id, {
+      followupPausado: true,
+      pausaEm: new Date().toISOString(),
+      pausaMotivo: motivo.trim(),
+      pausaPorUid: (perfil && perfil.uid) || "",
+      pausaPorQuem: (perfil && (perfil.nome || perfil.email)) || ""
+    });
+    setMarcando(false); setMotivo("");
+  };
+  const retomar = () => { clientes.atualizar(c.id, camposRetomada(c, perfil)); setRetomando(false); };
+
+  const caixa = { width:17, height:17, accentColor:PAUSA_COR, flexShrink:0, marginTop:2,
+                  cursor: podeEditar ? "pointer" : "default" };
+
+  if (!pausado) return (
+    <Card style={{ padding:"12px 14px", marginBottom:14 }}>
+      <label style={{ display:"flex", alignItems:"flex-start", gap:10,
+                      cursor: podeEditar ? "pointer" : "default" }}>
+        <input type="checkbox" checked={marcando} disabled={!podeEditar} style={caixa}
+               onChange={e => { setMarcando(e.target.checked); if (!e.target.checked) setMotivo(""); }} />
+        <span>
+          <span style={{ fontSize:13.5, fontWeight:600 }}>Pausar follow-up</span>
+          <span style={{ display:"block", fontSize:12, color:C.muted, lineHeight:1.5, marginTop:2 }}>
+            O cliente sai da fila de contatos e dos avisos até alguém retomar. Nada é apagado.
+          </span>
+        </span>
+      </label>
+      {marcando && (
+        <div style={{ marginTop:12, paddingLeft:27, display:"grid", gap:10 }}>
+          <Campo label="Motivo da pausa" hint="Opcional, mas ajuda quem pegar a ficha depois.">
+            <Inp value={motivo} onChange={e => setMotivo(e.target.value)} autoFocus
+                 placeholder="Ex.: pediu para retornar depois da audiência do dia 20." />
+          </Campo>
+          <div style={{ display:"flex", gap:8, justifyContent:"flex-end", flexWrap:"wrap" }}>
+            <Btn kind="ghost" size="sm" onClick={() => { setMarcando(false); setMotivo(""); }}>Cancelar</Btn>
+            <Btn kind="primary" size="sm" onClick={pausar}>Pausar follow-up</Btn>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+
+  return (
+    <Card style={{ padding:"12px 14px", marginBottom:14, background:"#5E6E8512",
+                   border:"1px solid #5E6E8540" }}>
+      <label style={{ display:"flex", alignItems:"flex-start", gap:10,
+                      cursor: podeEditar ? "pointer" : "default" }}>
+        <input type="checkbox" checked={!retomando} disabled={!podeEditar} style={caixa}
+               onChange={e => setRetomando(!e.target.checked)} />
+        <span style={{ flex:1 }}>
+          <span style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+            <span style={{ fontSize:13.5, fontWeight:600 }}>Follow-up pausado</span>
+            <Tag cor={PAUSA_COR}>
+              desde {fmtBR(diaLocal(c.pausaEm))}{dias > 0 ? ` · há ${dias} ${dias === 1 ? "dia" : "dias"}` : " · hoje"}
+            </Tag>
+          </span>
+          <span style={{ display:"block", fontSize:12.5, color:C.inkSoft, lineHeight:1.5, marginTop:4 }}>
+            {c.pausaMotivo ? <>Motivo: <strong>{c.pausaMotivo}</strong></> : "Sem motivo informado."}
+            {c.pausaPorQuem ? <span style={{ color:C.muted }}> · por {c.pausaPorQuem}</span> : null}
+          </span>
+          {podeEditar && !retomando && (
+            <span style={{ display:"block", fontSize:11.5, color:C.muted, marginTop:4 }}>
+              Desmarque a caixa para retomar.
+            </span>
+          )}
+        </span>
+      </label>
+      {retomando && (
+        <div style={{ marginTop:12, paddingLeft:27, display:"grid", gap:10 }}>
+          <div style={{ fontSize:12.5, color:C.inkSoft, lineHeight:1.55 }}>
+            {dias > 0 && emAberto > 0
+              ? <>Os {emAberto} {emAberto === 1 ? "toque em aberto anda" : "toques em aberto andam"}{" "}
+                  {dias} {dias === 1 ? "dia" : "dias"} para frente — o tempo da pausa — ajustados para dia útil.
+                  O que já foi relatado não muda.</>
+              : "Os toques em aberto voltam para a fila nas datas que já tinham."}
+          </div>
+          <div style={{ display:"flex", gap:8, justifyContent:"flex-end", flexWrap:"wrap" }}>
+            <Btn kind="ghost" size="sm" onClick={() => setRetomando(false)}>Manter pausado</Btn>
+            <Btn kind="brass" size="sm" onClick={retomar}>Retomar follow-up</Btn>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 /* ----------------------- reabertura ------------------------------ */
 function ReabrirModal({ cliente, ctx, onFechar }) {
   const { clientes, perfil } = ctx;
@@ -2887,6 +3025,7 @@ function ReabrirModal({ cliente, ctx, onFechar }) {
       inicioCiclo: inicio,
       followups: gerarFollowups(inicio),
       desfecho: null, motivo: null, motivoOutro: "", desfechoNota: "", desfechoEm: null,
+      ...CAMPOS_SEM_PAUSA,
       estagio,
       reabertoEm: new Date().toISOString(),
       reabertoPor: perfil.uid,
@@ -2951,7 +3090,7 @@ function listarPendencias(clientes) {
   const hoje = todayISO(), hm = agoraHM();
   const fila = [];
   clientes.forEach(c => {
-    if (c.desfecho) return;
+    if (c.desfecho || c.followupPausado) return;
     const fups = Array.isArray(c.followups) ? c.followups : [];
     for (let i = 0; i < fups.length; i++) {
       const f = fups[i];
@@ -2993,7 +3132,7 @@ function filaDoDia(clientes, slotFiltro, filaPronta) {
 
 /* Quantos clientes ainda estão na cadência antiga de seis contatos. */
 const contarCadenciaAntiga = (clientes) =>
-  clientes.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).length;
+  clientes.filter(c => !c.desfecho && !c.followupPausado && ehCadenciaAntiga(c.followups)).length;
 
 const CHAVE_AVISO = "zelo.ultimoAviso";
 const CHAVE_AVISO_LIGADO = "zelo.avisosLigados";
@@ -3137,6 +3276,7 @@ function Followup({ ctx }) {
   const chavePg = busca + "|" + slotFiltro;
   const emDiaNaoUtil = useMemo(() => contarNaoUteis(clientes.itens), [clientes.itens]);
   const antigos = useMemo(() => contarCadenciaAntiga(clientes.itens), [clientes.itens]);
+  const pausados = useMemo(() => itens.filter(estaPausado), [itens]);
 
   /* avisos do navegador */
   const [avisos, setAvisos] = useState(() => lerGuardado(CHAVE_AVISO_LIGADO) === "1");
@@ -3156,7 +3296,7 @@ function Followup({ ctx }) {
   };
 
   const corrigirDiasNaoUteis = () => {
-    clientes.itens.filter(c => !c.desfecho).forEach(c => {
+    clientes.itens.filter(c => !c.desfecho && !c.followupPausado).forEach(c => {
       const { lista, mudou } = ajustarParaDiasUteis(c.followups);
       if (mudou) clientes.atualizar(c.id, { followups: lista });
     });
@@ -3165,7 +3305,7 @@ function Followup({ ctx }) {
   /* Atualiza todo mundo que ficou na cadência antiga. Nada é apagado:
      o que já foi registrado vira histórico em "contatosAnteriores". */
   const migrarTodos = () => {
-    clientes.itens.filter(c => !c.desfecho && ehCadenciaAntiga(c.followups)).forEach(c => {
+    clientes.itens.filter(c => !c.desfecho && !c.followupPausado && ehCadenciaAntiga(c.followups)).forEach(c => {
       const feitos = (c.followups || []).filter(f => f.feito)
         .map(f => ({ dia:f.dia, data:f.data, canal:f.canal || "", canalOutro:f.canalOutro || "",
                      semResposta: !!f.semResposta, nota:f.nota || "", feitoEm:f.feitoEm || null,
@@ -3324,6 +3464,35 @@ function Followup({ ctx }) {
               Mais {fila.depois.length} {fila.depois.length === 1 ? "contato programado" : "contatos programados"} para depois desta semana.
             </p>
           )}
+
+          {pausados.length > 0 && (
+            <div style={{ marginTop:26 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:4 }}>
+                <span style={{ width:9, height:9, borderRadius:"50%", background:PAUSA_COR }} />
+                <span className="fr" style={{ fontSize:17, fontWeight:700 }}>Follow-up pausado</span>
+                <span style={{ fontSize:13, color:C.muted }}>{pausados.length}</span>
+              </div>
+              <div style={{ fontSize:12, color:C.muted, marginBottom:10, paddingLeft:18 }}>
+                Fora da fila até alguém retomar na ficha do cliente.
+              </div>
+              <div style={{ display:"grid", gap:8 }}>
+                {pausados.map(c => (
+                  <Card key={c.id} onClick={() => setDetalhe(c.id)}
+                        style={{ padding:"11px 15px", cursor:"pointer", display:"flex",
+                                 alignItems:"center", gap:12, flexWrap:"wrap",
+                                 borderLeft:`3px solid ${PAUSA_COR}` }}>
+                    <div style={{ flex:1, minWidth:170 }}>
+                      <div style={{ fontSize:14.5, fontWeight:600 }}>{c.nome}</div>
+                      <div style={{ fontSize:12, color:C.muted, marginTop:3 }}>
+                        {c.pausaMotivo || "sem motivo informado"}
+                      </div>
+                    </div>
+                    <Tag cor={PAUSA_COR}>desde {fmtBR(diaLocal(c.pausaEm))}</Tag>
+                  </Card>
+                ))}
+              </div>
+            </div>
+          )}
         </>
       )}
 
@@ -3395,7 +3564,10 @@ function Funil({ ctx }) {
                           <div style={{ fontSize:12, fontWeight:600, color:C.brass, marginTop:5 }}>
                             {brl(c.valorProposta)}
                           </div>) : null}
-                        {prox && (
+                        {estaPausado(c) && (
+                          <div style={{ marginTop:7 }}><Tag cor={PAUSA_COR}>Follow-up pausado</Tag></div>
+                        )}
+                        {prox && !estaPausado(c) && (
                           <div style={{ marginTop:7 }}>
                             <Tag cor={statusCor(followStatus(prox.data))}>
                               D{prox.dia} · {fmtBR(prox.data)}
@@ -3782,6 +3954,7 @@ function Segmento({ valor, opcoes, onEscolher }) {
 const situacaoCadencia = (c) => {
   if (c.desfecho === "ganho")   return { texto:"Ganho", cor:C.ok };
   if (c.desfecho === "perdido") return { texto:"Perdido", cor:C.late };
+  if (estaPausado(c)) return { texto:"Follow-up pausado", cor:PAUSA_COR };
   const f = Array.isArray(c.followups) ? c.followups : [];
   if (!f.length) return { texto:"Sem cadência", cor:C.muted };
   const atrasados = f.filter(x => !x.feito && x.data < todayISO()).length;
@@ -3863,6 +4036,7 @@ function naoRelatadosDoDia(lista, dia) {
   const out = [];
   (lista || []).forEach(c => {
     if (c.desfecho) return;
+    if (c.followupPausado && c.pausaEm && dia >= diaLocal(c.pausaEm)) return;
     (Array.isArray(c.followups) ? c.followups : []).forEach(f => {
       if (f.feito || f.data !== dia) return;
       out.push({ clienteId:c.id, cliente:c.nome || "(sem nome)",
