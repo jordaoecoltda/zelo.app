@@ -114,7 +114,7 @@ const MASTER_EMAIL = "smo.adv5@gmail.com";
 
 /* Marca da versão publicada — aparece no rodapé. Serve para conferir,
    sem adivinhação, qual arquivo o navegador está realmente carregando. */
-const BUILD = "2026-10-07-b";
+const BUILD = "2026-11-12-a";
 
 const configOK = !!(firebaseConfig.apiKey && firebaseConfig.databaseURL);
 let app = null, auth = null, db = null, appSec = null;
@@ -175,12 +175,23 @@ const MOTIVOS_GANHO = [
 ];
 
 /* ---------------------- cadência de contato ----------------------
-   D1 a D8 em dias seguidos. Cada dia tem dois toques de horário fixo:
-   08h e 14h. São 16 contatos por ciclo e cada um exige o relato
-   do que foi conversado ou enviado.                                 */
+   D1 a D8 em dias seguidos. Cada dia tem um toque de horário fixo:
+   08h. São 8 contatos por ciclo e cada um exige o relato do que foi
+   conversado ou enviado. (Até 2026-11-12 havia também o toque das
+   14h — removido a pedido do escritório.)                           */
 const CADENCIA_DIAS = 8;
-const SLOTS = ["08:00", "14:00"];
+const SLOTS = ["08:00"];
+/* "14:00" fica no dicionário só para rotular toques antigos já registrados. */
 const SLOT_NOME = { "08:00":"Manhã", "14:00":"Tarde" };
+
+/* Toque em aberto com horário que saiu da grade (ex.: 14h depois de
+   2026-11-12) deixa de existir. Toques já feitos ficam como histórico. */
+const fupNaGrade = f => f.feito || !f.slot || SLOTS.indexOf(f.slot) !== -1;
+const limparForaDaGrade = c => {
+  if (!Array.isArray(c.followups)) return c;
+  const lista = c.followups.filter(fupNaGrade);
+  return lista.length === c.followups.length ? c : { ...c, followups: lista };
+};
 
 /* true  = D1..D8 pulam sábado, domingo e feriado nacional (escritório fechado)
    false = D1..D8 em dias corridos, inclusive fim de semana                  */
@@ -694,7 +705,7 @@ function Paginacao({ p, rotulo = "registros" }) {
 /* ================================================================= *
  *  ACESSO AO BANCO
  * ================================================================= */
-function useColecao(path, ativo = true) {
+function useColecao(path, ativo = true, ajuste = null) {
   const [itens, setItens] = useState([]);
   const [carregando, setCarregando] = useState(true);
   useEffect(() => {
@@ -702,7 +713,8 @@ function useColecao(path, ativo = true) {
     const ref = db.ref(path);
     const cb = ref.on("value", snap => {
       const v = snap.val() || {};
-      setItens(Object.keys(v).map(id => ({ id, ...v[id] })));
+      const lista = Object.keys(v).map(id => ({ id, ...v[id] }));
+      setItens(ajuste ? lista.map(ajuste) : lista);
       setCarregando(false);
     }, () => setCarregando(false));
     return () => ref.off("value", cb);
@@ -918,7 +930,7 @@ function Workspace({ user, perfil }) {
   const P = perm(perfil.papel);
   const [aba, setAba] = useState("painel");
 
-  const clientes  = useColecao("clientes");
+  const clientes  = useColecao("clientes", true, limparForaDaGrade);
   const processos = useColecao("processos");
   const eventos   = useColecao("eventos");
 
@@ -2102,7 +2114,7 @@ function ImportarClientes({ ctx, onFechar }) {
           )}
 
           <Campo label="Cadência de contato para os importados"
-                 hint="Cada dia tem dois toques. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato.">
+                 hint="Cada dia tem um toque, às 08h. Ligar a cadência para uma base inteira de uma vez enche a fila de imediato.">
             <Sel value={modoCadencia} onChange={e => setModoCadencia(e.target.value)}>
               <option value="nao">Não iniciar agora — cadastrar só as fichas</option>
               <option value="hoje">Começar hoje, para todos</option>
@@ -2121,7 +2133,7 @@ function ImportarClientes({ ctx, onFechar }) {
             <div style={{ fontSize:12.5, color:C.brass, background:"#9C7C3C12",
                           padding:"9px 12px", borderRadius:9, lineHeight:1.55 }}>
               Isso cria {aGravar.length * CADENCIA_DIAS * SLOTS.length} contatos na fila
-              ({aGravar.length} × {CADENCIA_DIAS} dias × {SLOTS.length} toques). Se a ideia é
+              ({aGravar.length} × {CADENCIA_DIAS} dias × {SLOTS.length} {SLOTS.length === 1 ? "toque" : "toques"}). Se a ideia é
               retomar aos poucos, cadastre sem cadência e ligue cliente a cliente na ficha.
             </div>
           )}
@@ -3416,7 +3428,7 @@ function Followup({ ctx }) {
         {pendente === 0
           ? `Nenhum contato vencido às ${agora.replace(":", "h")}. A cadência está em dia.`
           : `${pendente} ${pendente === 1 ? "contato para fazer" : "contatos para fazer"} agora, contando os atrasados.`}
-        {" "}Cada cliente tem dois toques por dia — {SLOTS.map(h => h.replace(":", "h")).join(", ")} — e cada um
+        {" "}Cada cliente tem um toque por dia, às {SLOTS.map(h => h.replace(":", "h")).join(", ")}, e cada um
         pede o relato do que foi conversado ou enviado.
       </p>
       {avisos && (
@@ -3497,7 +3509,7 @@ function Followup({ ctx }) {
               {emDiaNaoUtil} {emDiaNaoUtil === 1 ? "contato caiu" : "contatos caíram"} em fim de semana ou feriado
             </div>
             <div style={{ fontSize:12.5, color:C.muted, lineHeight:1.55 }}>
-              O ajuste move o dia inteiro para o próximo dia útil, com os dois toques juntos,
+              O ajuste move o toque para o próximo dia útil,
               sem mexer no que já foi registrado.
             </div>
           </div>
